@@ -15,13 +15,13 @@ def test_resolve_upload_multi_line_rows_keeps_explicit_multi_line() -> None:
     param_sets = [{"header_value": "A"}]
     payload = {
         "params": param_sets,
-        "multi_line": [{"line_amount": "100", "distribution_combination_id": "850"}],
+        "line_items": [{"line_amount": "100", "distribution_combination_id": "850"}],
     }
 
     resolved_params, resolved_multi_line = app._resolve_upload_multi_line_rows(
         payload=payload,
         param_sets=param_sets,
-        repeatable_blocks=[{"enabled": True, "sheet_name": "multi_line", "prompt": "", "match_key": ""}],
+        repeatable_blocks=[{"enabled": True, "sheet_name": "line_items", "prompt": "", "match_key": ""}],
         recording_name="demo",
         bucket="tenant",
         overwrite=True,
@@ -47,7 +47,7 @@ def test_resolve_upload_multi_line_rows_preserves_saved_sheet_when_payload_omits
     resolved_params, resolved_multi_line = app._resolve_upload_multi_line_rows(
         payload={"params": param_sets},
         param_sets=param_sets,
-        repeatable_blocks=[{"enabled": True, "sheet_name": "multi_line", "prompt": "", "match_key": ""}],
+        repeatable_blocks=[{"enabled": True, "sheet_name": "line_items", "prompt": "", "match_key": ""}],
         recording_name="demo",
         bucket="tenant",
         overwrite=True,
@@ -71,9 +71,9 @@ def test_resolve_upload_multi_line_rows_does_not_preserve_when_payload_explicitl
     )
 
     resolved_params, resolved_multi_line = app._resolve_upload_multi_line_rows(
-        payload={"params": param_sets, "multi_line": []},
+        payload={"params": param_sets, "line_items": []},
         param_sets=param_sets,
-        repeatable_blocks=[{"enabled": True, "sheet_name": "multi_line", "prompt": "", "match_key": ""}],
+        repeatable_blocks=[{"enabled": True, "sheet_name": "line_items", "prompt": "", "match_key": ""}],
         recording_name="demo",
         bucket="tenant",
         overwrite=True,
@@ -88,14 +88,14 @@ def test_build_recording_entry_includes_inline_multi_line_rows() -> None:
         "demo",
         parameters={
             "params": [{"invoice_number": "INV-1"}],
-            "multi_line": [{"line_amount": "100", "distribution_combination_id": "850"}],
+            "line_items": [{"line_amount": "100", "distribution_combination_id": "850"}],
         },
         after_action_wait_ms=0,
         bucket="tenant",
     )
 
     assert entry["parameters"] == {"invoice_number": "INV-1"}
-    assert entry["multi_line"] == [{"line_amount": "100", "distribution_combination_id": "850"}]
+    assert entry["line_items"] == [{"line_amount": "100", "distribution_combination_id": "850"}]
     assert entry["skip_parameters_file_load"] is True
 
 
@@ -118,7 +118,7 @@ def test_build_recording_entry_keeps_saved_multi_line_rows(monkeypatch) -> None:
     )
 
     assert entry["parameters"] == {"invoice_number": "INV-1"}
-    assert entry["multi_line"] == [{"line_amount": "100", "distribution_combination_id": "850"}]
+    assert entry["line_items"] == [{"line_amount": "100", "distribution_combination_id": "850"}]
     assert entry["skip_parameters_file_load"] is True
 
 
@@ -126,16 +126,16 @@ def test_normalize_repeatable_blocks_config_keeps_match_key() -> None:
     config = app._normalize_repeatable_blocks_config(
         [{
             "enabled": True,
-            "sheet_name": "multi_line",
-            "match_key": "Header ID",
+            "sheet_name": "line_items",
+            "match_key": "Ref ID",
             "prompt": "loop rows",
         }]
     )
 
     assert config == [{
         "enabled": True,
-        "sheet_name": "multi_line",
-        "match_key": "header_id",
+        "sheet_name": "line_items",
+        "match_key": "ref_id",
         "prompt": "loop rows",
     }]
 
@@ -148,8 +148,8 @@ def test_build_recording_entries_groups_multi_line_rows_by_match_key(monkeypatch
             "repeatable_blocks": [
                 {
                     "enabled": True,
-                    "sheet_name": "multi_line",
-                    "match_key": "header_id",
+                    "sheet_name": "line_items",
+                    "match_key": "ref_id",
                     "prompt": "",
                 }
             ]
@@ -160,13 +160,13 @@ def test_build_recording_entries_groups_multi_line_rows_by_match_key(monkeypatch
         "demo",
         parameters={
             "params": [
-                {"header_id": "INV1", "customer_name": "Customer 1"},
-                {"header_id": "INV2", "customer_name": "Customer 2"},
+                {"ref_id": "INV1", "customer_name": "Customer 1"},
+                {"ref_id": "INV2", "customer_name": "Customer 2"},
             ],
-            "multi_line": [
-                {"header_id": "INV1", "line_description": "Line 1", "quantity": "1"},
-                {"header_id": "INV1", "line_description": "Line 2", "quantity": "2"},
-                {"header_id": "INV2", "line_description": "Line 3", "quantity": "3"},
+            "line_items": [
+                {"ref_id": "INV1", "line_description": "Line 1", "quantity": "1"},
+                {"ref_id": "INV1", "line_description": "Line 2", "quantity": "2"},
+                {"ref_id": "INV2", "line_description": "Line 3", "quantity": "3"},
             ],
         },
         after_action_wait_ms=0,
@@ -175,14 +175,14 @@ def test_build_recording_entries_groups_multi_line_rows_by_match_key(monkeypatch
 
     assert len(entries) == 2
     assert entries[0]["name"] == "demo [row 1]"
-    assert entries[0]["parameters"] == {"header_id": "INV1", "customer_name": "Customer 1"}
-    assert entries[0]["multi_line"] == [
-        {"header_id": "INV1", "line_description": "Line 1", "quantity": "1"},
-        {"header_id": "INV1", "line_description": "Line 2", "quantity": "2"},
+    assert entries[0]["parameters"] == {"ref_id": "INV1", "customer_name": "Customer 1"}
+    assert entries[0]["line_items"] == [
+        {"ref_id": "INV1", "line_description": "Line 1", "quantity": "1"},
+        {"ref_id": "INV1", "line_description": "Line 2", "quantity": "2"},
     ]
-    assert entries[1]["parameters"] == {"header_id": "INV2", "customer_name": "Customer 2"}
-    assert entries[1]["multi_line"] == [
-        {"header_id": "INV2", "line_description": "Line 3", "quantity": "3"},
+    assert entries[1]["parameters"] == {"ref_id": "INV2", "customer_name": "Customer 2"}
+    assert entries[1]["line_items"] == [
+        {"ref_id": "INV2", "line_description": "Line 3", "quantity": "3"},
     ]
 
 
@@ -197,8 +197,8 @@ def test_build_recording_entries_rejects_multi_headers_without_match_key(monkeyp
                     {"customer_name": "Customer 1"},
                     {"customer_name": "Customer 2"},
                 ],
-                "multi_line": [
-                    {"header_id": "INV1", "line_description": "Line 1", "quantity": "1"},
+                "line_items": [
+                    {"ref_id": "INV1", "line_description": "Line 1", "quantity": "1"},
                 ],
             },
             after_action_wait_ms=0,

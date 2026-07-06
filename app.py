@@ -31,15 +31,15 @@ import boto3
 import psycopg2
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # --------------------------------------------------------------------------- paths / config
 HERE = Path(__file__).resolve().parent
-# The runner project dir (formerly "test_runner", renamed to "act_agent"); the env var keeps its
-# legacy name so existing shell configs keep working. It holds the venv + aetherion CLI used below.
-TEST_RUNNER_DIR = Path(os.environ.get("TEST_RUNNER_DIR", HERE.parent / "act_agent")).resolve()
+# The runner project dir (the "act" repo / ACT Agent); the TEST_RUNNER_DIR env var keeps its legacy
+# name so existing shell configs keep working. It holds the venv + aetherion CLI used below.
+TEST_RUNNER_DIR = Path(os.environ.get("TEST_RUNNER_DIR", HERE.parent / "act")).resolve()
 AETHERION_BIN = os.environ.get("AETHERION_BIN", str(TEST_RUNNER_DIR / ".venv" / "bin" / "aetherion"))
 DOWNLOADS_DIR = TEST_RUNNER_DIR / "downloads"
 
@@ -63,7 +63,9 @@ def _cfg(key: str, default: str = "") -> str:
 
 
 DEFAULT_AFTER_ACTION_WAIT_MS = int(_cfg("DEFAULT_AFTER_ACTION_WAIT_MS", "0") or "0")
-DEFAULT_MULTI_LINE_SHEET_NAME = "multi_line"
+DEFAULT_MULTI_LINE_SHEET_NAME = "line_items"
+# Older recordings/payloads used "multi_line" for the repeatable sheet / row key; still accepted.
+_LEGACY_MULTI_LINE_SHEET_NAME = "multi_line"
 
 
 STORAGE_ENDPOINT = _cfg("STORAGE_ENDPOINT", "http://localhost:9000")
@@ -211,11 +213,22 @@ def normalize_param_sets(payload: Any, *, allow_empty: bool = False) -> list[dic
     return out
 
 
+def _multi_line_key_in(payload: Any) -> str | None:
+    """Return whichever repeatable-rows key the payload uses (current or legacy), else None."""
+    if not isinstance(payload, dict):
+        return None
+    for key in (DEFAULT_MULTI_LINE_SHEET_NAME, _LEGACY_MULTI_LINE_SHEET_NAME):
+        if key in payload:
+            return key
+    return None
+
+
 def _normalize_multi_line_rows(payload: Any) -> list[dict[str, str]]:
     if payload is None:
         return []
-    if isinstance(payload, dict) and DEFAULT_MULTI_LINE_SHEET_NAME in payload:
-        raw = payload.get(DEFAULT_MULTI_LINE_SHEET_NAME) or []
+    key = _multi_line_key_in(payload)
+    if key is not None:
+        raw = payload.get(key) or []
     elif isinstance(payload, list):
         raw = payload
     else:
@@ -225,7 +238,7 @@ def _normalize_multi_line_rows(payload: Any) -> list[dict[str, str]]:
 
 
 def _payload_explicitly_sets_multi_line(payload: Any) -> bool:
-    return isinstance(payload, dict) and DEFAULT_MULTI_LINE_SHEET_NAME in payload
+    return _multi_line_key_in(payload) is not None
 
 
 def _normalize_field_key(value: Any) -> str:
@@ -248,10 +261,11 @@ def _extract_row_value_by_key(row: dict[str, Any], match_key: str) -> str:
 
 
 def _payload_without_multi_line(payload: Any) -> Any:
-    if not isinstance(payload, dict) or DEFAULT_MULTI_LINE_SHEET_NAME not in payload:
+    if _multi_line_key_in(payload) is None:
         return payload
     cleaned = dict(payload)
     cleaned.pop(DEFAULT_MULTI_LINE_SHEET_NAME, None)
+    cleaned.pop(_LEGACY_MULTI_LINE_SHEET_NAME, None)
     return cleaned
 
 
@@ -398,23 +412,40 @@ def build_params_xlsx(
     *,
     multi_line_rows: list[dict[str, str]] | None = None,
     multi_line_sheet_name: str = DEFAULT_MULTI_LINE_SHEET_NAME,
+    match_key: str | None = None,
 ) -> bytes:
     import openpyxl
+
+    # When a repeatable block declares a match key (e.g. "ref_id"), materialize that column in
+    # BOTH sheets so each header row is explicitly linked to its repeated rows: header rows get
+    # 1, 2, 3...; repeated rows keep their own value or default to "1" (the first header).
+    match_key = (match_key or "").strip()
 
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "params"
     ph = _headers(param_sets)
+    if match_key and match_key not in ph:
+        ph = [match_key, *ph]
     ws.append(ph)
-    for row in param_sets:
-        ws.append([row.get(h, "") for h in ph])
+    for idx, row in enumerate(param_sets, start=1):
+        ws.append(
+            [str(idx) if h == match_key and match_key not in row else row.get(h, "") for h in ph]
+        )
     if multi_line_rows is not None:
         sheet = wb.create_sheet(title=_safe_name(multi_line_sheet_name) or DEFAULT_MULTI_LINE_SHEET_NAME)
         mh = _headers(multi_line_rows)
+        if match_key and match_key not in mh:
+            mh = [match_key, *mh]
         if mh:
             sheet.append(mh)
             for row in multi_line_rows:
-                sheet.append([row.get(h, "") for h in mh])
+                sheet.append(
+                    [
+                        row.get(h, "1" if h == match_key else "")
+                        for h in mh
+                    ]
+                )
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
@@ -558,7 +589,7 @@ def get_script(name: str, bucket: str = ""):
     db = db_rows_by_name([safe]).get(safe)
     return {"name": safe, "py_key": py_key, "py_text": py_text, "params_key": params_key,
             "params": params_rows, "placeholders": _placeholders(py_text), "db": db,
-            "recording_config": recording_config, "multi_line": multi_line_rows}
+            "recording_config": recording_config, "line_items": multi_line_rows}
 
 
 def _parse_params_back(raw: bytes, ext: str) -> list[dict[str, str]]:
@@ -671,6 +702,11 @@ class UploadBody(BaseModel):
     repeatable_blocks: Any = None
 
 
+class ParamsXlsxBody(BaseModel):
+    name: str = ""
+    params: Any
+
+
 def _resolve_upload_name(raw_name: str, payload: Any) -> str:
     direct = _safe_name(raw_name)
     if direct:
@@ -694,6 +730,22 @@ def _resolve_upload_name(raw_name: str, payload: Any) -> str:
         if safe:
             return safe
     return ""
+
+
+@app.post("/api/params-xlsx")
+def download_params_xlsx(body: ParamsXlsxBody):
+    try:
+        payload = json.loads(body.params) if isinstance(body.params, str) else body.params
+        param_sets = normalize_param_sets(payload, allow_empty=True)
+        multi_line_rows = _normalize_multi_line_rows(payload)
+        raw = build_params_xlsx(param_sets, multi_line_rows=multi_line_rows)
+    except Exception as exc:
+        raise HTTPException(400, f"failed to build params workbook: {exc}")
+    DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    safe = _safe_name(body.name or "recording_name") or "recording_name"
+    dest = DOWNLOADS_DIR / f"{safe}_params_preview.xlsx"
+    dest.write_bytes(raw)
+    return {"ok": True, "download_name": dest.name, "download_url": _report_url_for_dest(dest)}
 
 
 @app.post("/api/upload")
@@ -731,10 +783,16 @@ def upload(body: UploadBody):
             if isinstance(primary_block, dict)
             else DEFAULT_MULTI_LINE_SHEET_NAME
         )
+        match_key = (
+            str(primary_block.get("match_key") or "")
+            if isinstance(primary_block, dict)
+            else ""
+        )
         params_bytes, ext, ct = build_params_xlsx(
             param_sets,
             multi_line_rows=multi_line_rows if repeatable_blocks else None,
             multi_line_sheet_name=multi_line_sheet_name,
+            match_key=match_key,
         ), "_params.xlsx", \
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     else:
@@ -1186,48 +1244,111 @@ def _find_available_port(preferred_port: int, host: str = "127.0.0.1", *, attemp
 
 HTML = """<!doctype html><html><head><meta charset=utf-8><title>agent_shubham</title>
 <style>
-:root{--bg:#0f1117;--panel:#171a22;--line:#262b36;--fg:#e6e9ef;--mut:#8b93a7;--acc:#4f8cff;--ok:#36c98a;--bad:#ff6b6b}
-*{box-sizing:border-box}body{margin:0;font:14px/1.45 -apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
-header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
-header h1{font-size:15px;margin:0;font-weight:600}header .meta{color:var(--mut);font-size:12px}
-.wrap{display:grid;grid-template-columns:340px 1fr;height:calc(100vh - 46px)}
-.col{overflow:auto;padding:14px}.col.left{border-right:1px solid var(--line);background:#12141b}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:12px}
-.script{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border:1px solid var(--line);border-radius:7px;margin-bottom:7px;background:#12141b}
-.script .nm{font-weight:600;font-size:13px;word-break:break-all}
-.script .sub{color:var(--mut);font-size:11px}
-.badge{font-size:10px;padding:1px 6px;border-radius:10px;border:1px solid var(--line)}
-.badge.db{color:var(--ok);border-color:#1e4d39}.badge.nodb{color:var(--mut)}
-button{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:6px 11px;font-weight:600;cursor:pointer;font-size:12px}
-button.ghost{background:#222838;color:var(--fg)}button:disabled{opacity:.5;cursor:wait}
-a.btn{display:inline-flex;align-items:center;justify-content:center;background:var(--acc);color:#fff;border:0;border-radius:6px;padding:6px 11px;font-weight:600;cursor:pointer;font-size:12px;text-decoration:none}
-a.btn.ghost{background:#222838;color:var(--fg)}
-label{display:block;color:var(--mut);font-size:12px;margin:8px 0 3px}
-input,textarea,select{width:100%;background:#0d0f15;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px;font-family:ui-monospace,Menlo,monospace;font-size:12px}
-textarea{resize:vertical}.row{display:flex;gap:10px}.row>*{flex:1}
-.inline-check{display:flex;align-items:center;gap:8px;margin:12px 0 4px;color:var(--fg);font-size:12px}
+:root{--bg:#0f1117;--bg-soft:#12141b;--panel:#171a22;--panel-2:#141821;--line:#262b36;--line-strong:#39507d;--fg:#e6e9ef;--mut:#8b93a7;--acc:#4f8cff;--acc-2:#6b98ff;--ok:#36c98a;--bad:#ff6b6b;--shadow:0 14px 30px rgba(0,0,0,.22)}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;font:14px/1.5 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--fg)}
+header{display:flex;align-items:center;gap:12px;justify-content:space-between;padding:12px 18px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+header h1{font-size:15px;margin:0;font-weight:700;letter-spacing:.01em}
+header .meta{color:var(--mut);font-size:12px}
+.wrap{display:grid;grid-template-columns:380px 1fr;height:calc(100vh - 56px)}
+.col{overflow:auto;padding:14px}
+.col.left{border-right:1px solid var(--line);background:var(--bg-soft)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:14px;box-shadow:var(--shadow);animation:fadeUp .24s cubic-bezier(.22,1,.36,1);transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}
+.card:hover{transform:translateY(-1px);border-color:var(--line-strong);box-shadow:0 22px 44px rgba(5,10,20,.32)}
+.script{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:8px;align-items:center;padding:9px 10px;border:1px solid var(--line);border-radius:10px;margin-bottom:6px;background:var(--bg-soft);transition:transform .16s ease,border-color .16s ease,background .16s ease,box-shadow .16s ease;animation:fadeUp .18s ease}
+.script:hover{border-color:var(--line-strong);transform:translateY(-1px);box-shadow:0 10px 24px rgba(4,8,18,.28)}
+.script.sel{border-color:var(--acc);background:#13203a;box-shadow:0 0 0 1px rgba(79,140,255,.18),0 14px 30px rgba(7,12,23,.24)}
+.script-main{min-width:0}
+.script-top{display:flex;gap:8px;align-items:flex-start;min-width:0}
+.script-copy{min-width:0}
+.script .nm{font-weight:700;font-size:13px;word-break:normal;overflow-wrap:anywhere;line-height:1.45}
+.script .sub{color:var(--mut);font-size:11px;line-height:1.4;margin-top:2px}
+.script-actions{display:grid;grid-template-columns:1fr;gap:6px;align-items:stretch;width:92px}
+.script-btn{width:100%;min-width:0;height:34px;padding:0 10px;display:inline-flex;align-items:center;justify-content:center;border-radius:9px}
+.badge{display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:2px 7px;border-radius:999px;border:1px solid var(--line-strong);background:#0f1628}
+.badge.db{color:var(--ok);border-color:rgba(56,211,159,.28);background:rgba(56,211,159,.08)}
+.badge.nodb{color:var(--mut)}
+button{background:var(--acc);color:#fff;border:0;border-radius:10px;padding:8px 12px;font-weight:700;cursor:pointer;font-size:12px;line-height:1;transition:transform .14s ease,filter .14s ease,box-shadow .14s ease;box-shadow:0 8px 18px rgba(32,76,176,.20)}
+button:hover{transform:translateY(-1px);filter:brightness(1.03)}
+button:active{transform:translateY(0)}
+button.ghost{background:#19233a;color:var(--fg);box-shadow:none;border:1px solid var(--line)}
+button.ghost:hover{border-color:var(--line-strong);background:#1d2943}
+button:disabled{opacity:.55;cursor:wait;transform:none;filter:none}
+a.btn{display:inline-flex;align-items:center;justify-content:center;background:var(--acc);color:#fff;border:0;border-radius:10px;padding:8px 12px;font-weight:700;cursor:pointer;font-size:12px;text-decoration:none;line-height:1;box-shadow:0 8px 18px rgba(32,76,176,.20);transition:transform .14s ease,filter .14s ease}
+a.btn:hover{transform:translateY(-1px);filter:brightness(1.03)}
+a.btn.ghost{background:#19233a;color:var(--fg);box-shadow:none;border:1px solid var(--line)}
+label{display:block;color:var(--mut);font-size:12px;margin:10px 0 4px}
+input,textarea,select{width:100%;background:#0b1222;color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:9px 10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;transition:border-color .14s ease,box-shadow .14s ease,background .14s ease}
+input:focus,textarea:focus,select:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px rgba(91,140,255,.16);background:#0e1629}
+textarea{resize:vertical}
+.row{display:flex;gap:12px}
+.row>*{flex:1}.form-top-row{align-items:flex-start}.top-field{display:flex;flex-direction:column;min-width:0}.top-field label{margin-top:0}.top-field input,.top-field select{height:38px;padding-top:0;padding-bottom:0}.top-actions-field{flex:0 0 auto;min-width:max-content}.top-actions-field label{visibility:hidden}.top-actions-field .form-top-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px}.top-actions-field .form-top-actions .ghost,.top-actions-field .form-top-actions button{height:38px;min-width:auto;padding:0 14px;box-shadow:none}.prompt-strip{margin:2px 0 10px}.prompt-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px}.prompt-head label{margin:0}.prompt-head .inline-check.compact-check{flex:0 0 auto;margin:0;padding:0;border:0;background:transparent;border-radius:0;justify-content:flex-end;min-height:auto}.prompt-head .inline-check.compact-check input{margin:0}.repeatable-note{margin-top:6px;line-height:1.45}.form-top-row{align-items:flex-start}.top-field{display:flex;flex-direction:column;min-width:0}.top-field label{margin-top:0}.top-field input,.top-field select{height:38px;padding-top:0;padding-bottom:0}.top-actions-field{flex:0 0 auto;min-width:max-content}.top-actions-field label{visibility:hidden}.top-actions-field .form-top-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px}.top-actions-field .form-top-actions .ghost,.top-actions-field .form-top-actions button{height:38px;min-width:auto;padding:0 14px;box-shadow:none}.prompt-strip{margin:2px 0 10px}.prompt-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px}.prompt-head label{margin:0}.prompt-head .inline-check.compact-check{flex:0 0 auto;margin:0;padding:0;border:0;background:transparent;border-radius:0;justify-content:flex-end;min-height:auto}.prompt-head .inline-check.compact-check input{margin:0}.repeatable-note{margin-top:6px;line-height:1.45}.form-top-row{align-items:flex-start}.top-field{display:flex;flex-direction:column;min-width:0}.top-field label{margin-top:0}.top-field input,.top-field select{height:38px;padding-top:0;padding-bottom:0}.top-actions-field{flex:0 0 auto;min-width:max-content}.top-actions-field label{visibility:hidden}.top-actions-field .form-top-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px}.top-actions-field .form-top-actions .ghost,.top-actions-field .form-top-actions button{height:38px;min-width:auto;padding:0 14px;box-shadow:none}.prompt-strip{margin:2px 0 10px}.prompt-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px}.prompt-head label{margin:0}.prompt-head .inline-check.compact-check{flex:0 0 auto;margin:0;padding:0;border:0;background:transparent;border-radius:0;justify-content:flex-end;min-height:auto}.prompt-head .inline-check.compact-check input{margin:0}.repeatable-note{margin-top:6px;line-height:1.45}.form-top-row{align-items:flex-start}.top-field{display:flex;flex-direction:column;min-width:0}.top-field label{margin-top:0}.top-field input,.top-field select{height:38px;padding-top:0;padding-bottom:0}.top-actions-field{flex:0 0 auto;min-width:max-content}.top-actions-field label{visibility:hidden}.top-actions-field .form-top-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px}.top-actions-field .form-top-actions .ghost,.top-actions-field .form-top-actions button{height:38px;min-width:auto;padding:0 14px;box-shadow:none}.prompt-strip{margin:2px 0 10px}.prompt-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px}.prompt-head label{margin:0}.prompt-head .inline-check.compact-check{flex:0 0 auto;margin:0;padding:0;border:0;background:transparent;border-radius:0;justify-content:flex-end;min-height:auto}.prompt-head .inline-check.compact-check input{margin:0}.repeatable-note{margin-top:6px;line-height:1.45}.form-top-row{align-items:flex-start}.top-field{display:flex;flex-direction:column;min-width:0}.top-field label{margin-top:0}.top-field input,.top-field select{height:38px;padding-top:0;padding-bottom:0}.top-actions-field{flex:0 0 auto;min-width:max-content}.top-actions-field label{visibility:hidden}.form-top-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px}.form-top-actions .ghost,.form-top-actions button{height:38px;min-width:auto;padding:0 14px;box-shadow:none}.prompt-strip{margin:2px 0 10px}.prompt-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px}.prompt-head label{margin:0}.prompt-head .compact-check{flex:0 0 auto}.compact-check{margin:0;padding:0;border:0;background:transparent;justify-content:flex-end;min-height:auto}.compact-check input{margin:0}.repeatable-note{margin-top:6px;line-height:1.45}.form-top-row{align-items:flex-start}.top-field{display:flex;flex-direction:column;min-width:0}.top-field label{margin-top:0}.top-field input,.top-field select{height:38px;padding-top:0;padding-bottom:0}.top-actions-field{flex:0 0 auto;min-width:max-content}.top-actions-field label{visibility:hidden}.form-top-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px}.form-top-actions .ghost,.form-top-actions button{height:38px;min-width:auto;padding:0 14px;box-shadow:none}.prompt-strip{margin:2px 0 10px}.prompt-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px}.prompt-head label{margin:0}.prompt-head .compact-check{flex:0 0 auto}.compact-check{margin:0;padding:0;border:0;background:transparent;justify-content:flex-end;min-height:auto}.compact-check input{margin:0}.repeatable-note{margin-top:6px;line-height:1.45}
+.inline-check{display:flex;align-items:center;gap:10px;margin:14px 0 6px;color:var(--fg);font-size:12px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:#10182a}
 .inline-check input{width:auto;margin:0}
-.tabs{display:flex;gap:6px;margin-bottom:10px}.tab{padding:6px 12px;border:1px solid var(--line);border-radius:6px;cursor:pointer;color:var(--mut)}
+.tabs{display:flex;gap:8px;margin-bottom:12px}
+.tab{padding:8px 13px;border:1px solid var(--line);border-radius:10px;cursor:pointer;color:var(--mut);background:#10182a;transition:border-color .14s ease,background .14s ease,color .14s ease}
 .tab.on{color:var(--fg);border-color:var(--acc);background:#16213a}
-pre{background:#0a0c11;border:1px solid var(--line);border-radius:6px;padding:10px;overflow:auto;font-size:12px;white-space:pre-wrap;max-height:50vh}
-.msg{padding:8px 10px;border-radius:6px;margin:8px 0;font-size:12px;display:none}
-.msg.ok{background:#10271d;border:1px solid #1e4d39;color:var(--ok);display:block}
-.msg.err{background:#2a1416;border:1px solid #5a2327;color:var(--bad);display:block}
-a{color:var(--acc)}.spin{display:inline-block;width:12px;height:12px;border:2px solid #fff5;border-top-color:#fff;border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px}
-.actions{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
-.meta-line{color:var(--mut);font-size:12px;margin-top:8px}
+pre{background:#0a101d;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:12px;white-space:pre-wrap;max-height:50vh}
+.msg{padding:10px 12px;border-radius:10px;margin:10px 0;font-size:12px;display:none}
+.msg.ok{background:#11251d;border:1px solid rgba(56,211,159,.26);color:var(--ok);display:block}
+.msg.err{background:#291619;border:1px solid rgba(255,113,113,.28);color:var(--bad);display:block}
+a{color:var(--acc-2)}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid #fff5;border-top-color:#fff;border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 0}
+.meta-line{color:var(--mut);font-size:12px;margin-top:8px;line-height:1.5}
 @keyframes s{to{transform:rotate(360deg)}}
-/* suite checkbox + selected row */
-.suitechk{-webkit-appearance:checkbox;appearance:checkbox;width:18px;height:18px;accent-color:var(--acc);cursor:pointer;flex:0 0 auto;margin:0;padding:0;background:transparent;border:0;border-radius:0}
-.script{transition:border-color .12s,background .12s}
-.script:hover{border-color:#39507d}
-.script.sel{border-color:var(--acc);background:#13203a}
-/* CodeMirror integration */
-.CodeMirror{border:1px solid var(--line);border-radius:6px;height:auto;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;line-height:1.5}
-.CodeMirror-focused{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc)}
+@keyframes fadeUp{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+.suitechk,.inline-check input[type=checkbox]{-webkit-appearance:none;appearance:none;width:18px;height:18px;border:1px solid var(--line-strong);background:#0d1425;border-radius:6px;cursor:pointer;flex:0 0 auto;margin:0;padding:0;position:relative;transition:border-color .14s ease,background .14s ease,box-shadow .14s ease}
+.suitechk::after,.inline-check input[type=checkbox]::after{content:"";position:absolute;left:5px;top:2px;width:4px;height:8px;border:2px solid transparent;border-top:0;border-left:0;transform:rotate(45deg);opacity:0}
+.suitechk:checked,.inline-check input[type=checkbox]:checked{background:var(--acc);border-color:var(--acc);box-shadow:0 0 0 3px rgba(91,140,255,.14)}
+.suitechk:checked::after,.inline-check input[type=checkbox]:checked::after{border-color:#fff;opacity:1}
+.suitechk:hover,.inline-check input[type=checkbox]:hover{border-color:var(--acc)}
+.CodeMirror{border:1px solid var(--line);border-radius:12px;height:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;box-shadow:inset 0 1px 0 rgba(255,255,255,.02)}
+.CodeMirror-focused{border-color:var(--acc);box-shadow:0 0 0 3px rgba(91,140,255,.16)}
 .CodeMirror-gutters{border-right:1px solid var(--line)}
-.editor-tools{display:flex;gap:8px;align-items:center;margin:4px 0 2px}
+.editor-shell{margin:6px 0 10px;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:#0b1222;box-shadow:inset 0 1px 0 rgba(255,255,255,.02);transition:border-color .14s ease,box-shadow .14s ease,transform .14s ease}
+.editor-shell:hover{border-color:var(--line-strong)}
+.editor-shell:focus-within{border-color:var(--acc);box-shadow:0 0 0 3px rgba(91,140,255,.16)}
+.editor-shell.valid{border-color:rgba(56,211,159,.34)}
+.editor-shell.invalid{border-color:rgba(255,113,113,.38)}
+.editor-head{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:38px;padding:6px 12px;border-bottom:1px solid var(--line);background:var(--panel-2)}.editor-json-status{font-size:11px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--mut)}
+.editor-head-left{display:flex;align-items:center;gap:10px;min-width:0}.editor-head-right{display:flex;align-items:center;gap:8px;min-width:0}.editor-head-right{display:flex;align-items:center;gap:8px;min-width:0}.editor-head-right{display:flex;align-items:center;gap:8px;min-width:0}.editor-head-right{display:flex;align-items:center;gap:8px;min-width:0}.editor-head-right{display:flex;align-items:center;gap:8px;min-width:0}.editor-head-right{display:flex;align-items:center;gap:8px;min-width:0}.editor-head-right{display:flex;align-items:center;gap:8px;min-width:0}.editor-head-right{display:flex;align-items:center;gap:8px;min-width:0}.editor-icon-actions{display:flex;align-items:center;gap:6px}.editor-icon-btn{width:28px;height:28px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:8px;font-size:13px;box-shadow:none}
+.editor-kind{font-size:11px;font-weight:700;color:var(--fg);letter-spacing:.02em;text-transform:uppercase}
+.editor-hint{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.editor-status{font-size:11px;color:var(--mut);white-space:nowrap}
+.editor-pane{display:grid;grid-template-columns:48px minmax(0,1fr);align-items:stretch;min-height:0}
+.editor-gutter{padding:12px 8px 12px 0;background:#0d1425;border-right:1px solid var(--line);color:#5f7097;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-align:right;user-select:none;overflow:hidden}
+.editor-gutter span{display:block}
+.editor-shell textarea.code-fallback{display:block;width:100%;margin:0;border:0;border-radius:0;padding:12px 14px;background:#0b1222;color:var(--fg);font:12.5px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;overflow:auto;resize:vertical;tab-size:2;outline:none;box-shadow:none}
+.editor-shell textarea.code-fallback:focus{background:#0b1222;box-shadow:none}
+.editor-shell.cm-enhanced .editor-pane{display:block}
+.editor-shell.cm-enhanced .editor-gutter{display:none}
+.editor-shell.cm-enhanced .CodeMirror{border:0;border-radius:0;box-shadow:none}
+.editor-shell.cm-enhanced .CodeMirror-focused{border-color:transparent;box-shadow:none}
+.editor-grid{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,.95fr);gap:14px;align-items:start;margin:10px 0 8px}
+.field-block{min-width:0;display:flex;flex-direction:column}
+.field-head{display:flex;align-items:center;justify-content:space-between;gap:12px;height:32px;margin-bottom:6px}
+.field-head label{margin:0;line-height:1.2;flex:1 1 auto}
+.field-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.field-actions .ghost{box-shadow:none}.editor-top-actions{display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;flex:0 0 auto}.editor-top-actions .ghost{height:36px}.editor-top-actions{display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;flex:0 0 auto}.editor-top-actions .ghost{height:36px}.editor-top-actions{display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;flex:0 0 auto}.editor-top-actions .ghost{height:36px}.editor-top-actions{display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;flex:0 0 auto}.editor-top-actions .ghost{height:36px}.editor-top-actions{display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;flex:0 0 auto}.editor-top-actions .ghost{height:36px}.editor-top-actions{display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;flex:0 0 auto}.editor-top-actions .ghost{height:36px}.editor-top-actions{display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;flex:0 0 auto}.editor-top-actions .ghost{height:36px}.form-top-actions{display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;flex:0 0 auto}.form-top-actions .ghost,.form-top-actions button{height:36px}.field-actions-placeholder{visibility:hidden;pointer-events:none}
+.editor-tools{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin:8px 0 4px}
 .editor-tools .pill{font-size:11px;color:var(--mut)}
+.editor-compact-btn{padding:6px 10px;min-width:auto;box-shadow:none}
+.suite-card{padding:12px}
+.suite-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.suite-list{margin:0 0 10px 0;padding:0;list-style:none;display:grid;gap:7px}
+.suite-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:#0f1628}
+.suite-name{word-break:break-word;font-size:12px}
+.suite-actions{display:flex;gap:4px;white-space:nowrap}
+.suite-actions button{padding:6px 8px;min-width:auto;box-shadow:none}
+.section-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.search{margin-bottom:8px}
+.refresh-btn{padding:7px 10px;min-width:auto}.view-switch{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:8px}.side-tab{display:flex;align-items:center;justify-content:center;gap:8px;height:36px;padding:0 10px;box-shadow:none}.side-tab.on{background:#1e2b46;border:1px solid var(--acc);color:var(--fg)}.view-count{display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:#0f1628;border:1px solid var(--line);font-size:11px;color:var(--mut)}.side-tab.on .view-count{border-color:rgba(79,140,255,.45);color:var(--fg)}.run-shell{padding:12px}.run-tabbar{display:flex;gap:8px;overflow:auto;padding-bottom:2px;margin:10px 0}.run-tab{min-width:0;max-width:220px;height:34px;padding:0 12px;border-radius:9px;background:#11192b;color:var(--mut);border:1px solid var(--line);box-shadow:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.run-tab.on{background:#1d2a44;border-color:var(--acc);color:var(--fg)}.run-empty{padding:14px 12px;border:1px dashed var(--line);border-radius:10px;color:var(--mut);background:#111827}.run-title{display:flex;justify-content:space-between;align-items:center;margin:2px 0 8px 0}
+.upload-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.upload-actions button{min-height:40px}
+@media(max-width:860px){.editor-grid{grid-template-columns:1fr}.field-actions{justify-content:flex-start}.prompt-head{flex-direction:column;align-items:flex-start}.prompt-head .inline-check.compact-check{justify-content:flex-start}}
+@media(max-width:980px){.wrap{grid-template-columns:1fr}.col.left{border-right:0;border-bottom:1px solid var(--line)}.row{flex-direction:column;gap:10px}.script{grid-template-columns:1fr}.script-actions{grid-template-columns:repeat(2,minmax(0,1fr));width:100%}}
 </style>
 <link rel=stylesheet href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
 <link rel=stylesheet href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/dracula.min.css">
@@ -1236,56 +1357,58 @@ a{color:var(--acc)}.spin{display:inline-block;width:12px;height:12px;border:2px 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/matchbrackets.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/closebrackets.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/selection/active-line.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/searchcursor.min.js"></script>
 </head><body>
-<header><h1>agent_shubham</h1><span class=meta id=cfg></span><span style=flex:1></span><button class=ghost onclick=loadScripts()>↻ refresh</button></header>
+<header><h1>agent_shubham</h1><span class=meta id=cfg></span><span style=flex:1></span><button class="ghost refresh-btn" onclick=loadScripts()>Refresh</button></header>
 <div class=wrap>
   <div class="col left">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><b>Recordings</b><span class=meta id=count></span></div>
-    <input id=scriptSearch placeholder="search script name" style="margin-bottom:10px">
+    <div class=section-row><b>Recordings</b><span class=meta id=count></span></div>
+    <div class=view-switch><button class="ghost side-tab on" id=side-edit onclick="tab('edit')">Upload / Edit</button><button class="ghost side-tab" id=side-run onclick="tab('run')">Run Output <span id=runTabCount class=view-count>0</span></button></div>
+    <input id=scriptSearch class=search placeholder="search script name">
     <div id=suiteTray style=display:none></div>
     <div id=list></div>
   </div>
-  <div class="col">
-    <div class=tabs>
-      <div class="tab on" id=t-edit onclick="tab('edit')">Upload / Edit</div>
-      <div class="tab" id=t-run onclick="tab('run')">Run output</div>
-    </div>
+  <div class="col main-panel">
     <div id=p-edit>
       <div class=card>
-        <div class=row><div><label>Recording name</label><input id=name placeholder="PR-based-PO_CREATE_YEUTest_v1.0"></div>
-        <div style=flex:0.5><label>Params format</label><select id=fmt><option value=xlsx>xlsx</option><option value=csv>csv</option></select></div>
-        <div style=flex:0.5><label>Overwrite</label><select id=ov><option value=true>true</option><option value=false>false</option></select></div></div>
-        <label>Script (.py; Playwright may use {{placeholders}}, API/plain Python can call get_runtime_params())</label><textarea id=py rows=14 placeholder="paste a recorded Playwright or plain Python script"></textarea>
-        <label>Runtime JSON ({"params":[{...}]} or {...} or [{...}])</label><textarea id=params rows=8 placeholder='{"params":[{"username":"...","password":"..."}]}'></textarea>
-        <div class=editor-tools><button class=ghost style=padding:3px:9px onclick=formatParams()>⟳ Format JSON</button><span class=pill id=paramsStatus></span></div>
-        <label>Prompt</label><textarea id=prompt rows=4 placeholder="optional recording guidance or extraction prompt"></textarea>
+        <div class="row form-top-row"><div class=top-field><label>Recording name</label><input id=name placeholder="recording_name_v1"></div>
+        <div class=top-field style=flex:0.4><label>Overwrite</label><select id=ov><option value=true>true</option><option value=false>false</option></select></div>
+        <div class="top-field top-actions-field"><label>&nbsp;</label><div class=form-top-actions><button id=upbtn onclick=doUpload()>Upload to MinIO + DB</button><button class=ghost onclick=clearForm()>Clear</button></div></div></div>
+        <div class=editor-grid>
+          <div class=field-block>
+            <textarea id=py rows=14 placeholder="paste a recorded Playwright or plain Python script"></textarea>
+          </div>
+          <div class=field-block>
+            <textarea id=params rows=14 placeholder='{"params":[{"username":"...","password":"..."}]}'></textarea>
+          </div>
+        </div>
+        <label>Prompt</label><textarea id=prompt rows=4 placeholder="Recording guidance. If it has a repeatable block, name the repeated fields here, e.g. 'Repeat the line item for each row: Description, Quantity, Unit Price'."></textarea>
         <label class=inline-check><input id=repeatableLineItemsEnabled type=checkbox onchange=toggleRepeatableLineItems()>This recording has a repeatable block</label>
         <div id=repeatableLineItemsFields style=display:none>
-          <div class=row>
-            <div><label>Repeatable sheet name</label><input id=repeatableLineItemsSheet placeholder="multi_line" value="multi_line"></div>
-            <div><label>Header-line match key</label><input id=repeatableLineItemsMatchKey placeholder="header_id"></div>
-          </div>
-          <label>Repeatable block instructions</label><textarea id=repeatableLineItemsPrompt rows=4 placeholder="Describe the repeated section, for example: repeat the invoice row-entry block for each row in multi_line from Description through Unit Price."></textarea>
+          <div class=meta>Rows loop over the <b>line_items</b> sheet (linked by <b>ref_id</b>). Put the loop instructions in the Prompt field above.</div>
         </div>
         <div class=msg id=upmsg></div>
-        <div style=margin-top:10px><button id=upbtn onclick=doUpload()>⬆ Upload to MinIO + DB</button>
-        <button class=ghost onclick=clearForm()>clear</button></div>
       </div>
     </div>
     <div id=p-run style=display:none>
-      <div class=card><div style="display:flex;justify-content:space-between;align-items:center">
-        <div><b id=runName>—</b> <span class=meta id=runMeta></span></div></div>
-        <div class=row style="margin-top:10px">
+      <div class="card run-shell">
+        <div class=row style="margin-top:0">
           <div style=flex:0.5><label>Execution mode</label><select id=execMode><option value=parallel>parallel</option><option value=sequential>sequential</option></select></div>
           <div style=flex:0.5><label>After action wait (ms)</label><input id=waitMs type=number min=0 step=100 placeholder="0"></div>
         </div>
-        <div class=actions id=reportActions style=display:none>
-          <a id=openReportBtn class="btn" href="#" target="_blank" rel="noopener noreferrer">Open report</a>
-          <a id=downloadReportBtn class="btn ghost" href="#" download>Download report</a>
+        <div id=runTabs class=run-tabbar></div>
+        <div id=runEmpty class=run-empty>Run a recording from the sidebar to create an output tab.</div>
+        <div id=runPane style=display:none>
+          <div class=run-title><div><b id=runName>—</b> <span class=meta id=runMeta></span></div></div>
+          <div class=actions id=reportActions style=display:none>
+            <a id=openReportBtn class="btn" href="#" target="_blank" rel="noopener noreferrer">Open report</a>
+            <a id=downloadReportBtn class="btn ghost" href="#" download>Download report</a>
+          </div>
+          <div class=meta-line id=reportMeta></div>
+          <div class=msg id=runmsg></div>
+          <pre id=out>select a recording on the left and press Run</pre>
         </div>
-        <div class=meta-line id=reportMeta></div>
-        <div class=msg id=runmsg></div>
-        <pre id=out>select a recording on the left and press ▶ Run</pre>
       </div>
     </div>
   </div>
@@ -1294,6 +1417,7 @@ a{color:var(--acc)}.spin{display:inline-block;width:12px;height:12px;border:2px 
 let CFG={};
 let ALL_SCRIPTS=[];
 let SUITE=[];let SUITE_MODE='sequential';let SUITE_WAIT=0;
+let RUN_TABS=[];let ACTIVE_RUN_TAB_ID='';
 function inSuite(n){return SUITE.includes(n)}
 function toggleSuite(n,checked){if(checked){if(!SUITE.includes(n))SUITE.push(n)}else{SUITE=SUITE.filter(x=>x!==n)}renderSuite();renderScripts()}
 function moveSuite(i,d){const j=i+d;if(j<0||j>=SUITE.length)return;const t=SUITE[i];SUITE[i]=SUITE[j];SUITE[j]=t;renderSuite()}
@@ -1303,14 +1427,14 @@ function renderSuite(){
   const el=document.getElementById('suiteTray');
   if(!SUITE.length){el.style.display='none';el.innerHTML='';return}
   el.style.display='';
-  el.innerHTML=`<div class=card style=padding:10px>
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><b>Suite (${SUITE.length})</b>
-      <button class=ghost style=padding:3px:8px onclick=clearSuite()>clear</button></div>
-    <ol style="margin:0 0 8px 18px;padding:0;font-size:12px">${SUITE.map((n,i)=>`<li style="margin:3px 0;display:flex;align-items:center;gap:6px;justify-content:space-between">
-      <span style=word-break:break-all>${n}</span>
-      <span style=white-space:nowrap><button class=ghost style=padding:1px:6px onclick="moveSuite(${i},-1)">↑</button>
-      <button class=ghost style=padding:1px:6px onclick="moveSuite(${i},1)">↓</button>
-      <button class=ghost style=padding:1px:6px onclick="removeSuite('${n}')">✕</button></span></li>`).join('')}</ol>
+  el.innerHTML=`<div class="card suite-card">
+    <div class=suite-head><b>Suite (${SUITE.length})</b>
+      <button class=ghost onclick=clearSuite()>Clear</button></div>
+    <ol class=suite-list>${SUITE.map((n,i)=>`<li class=suite-item>
+      <span class=suite-name>${n}</span>
+      <span class=suite-actions><button class=ghost onclick="moveSuite(${i},-1)">↑</button>
+      <button class=ghost onclick="moveSuite(${i},1)">↓</button>
+      <button class=ghost onclick="removeSuite('${n}')">✕</button></span></li>`).join('')}</ol>
     <div class=row style=margin-bottom:8px>
       <div style=flex:0.6><label style=margin-top:0>Mode</label>
         <select id=suiteMode onchange="SUITE_MODE=this.value">
@@ -1318,34 +1442,161 @@ function renderSuite(){
           <option value=parallel ${SUITE_MODE=='parallel'?'selected':''}>parallel</option></select></div>
       <div style=flex:0.4><label style=margin-top:0>Wait ms</label>
         <input id=suiteWaitMs type=number min=0 step=100 value="${SUITE_WAIT}" oninput="SUITE_WAIT=Number(this.value||0)"></div></div>
-    <button onclick=runSuite()>▶ Run suite</button>
-    <div class=meta style=margin-top:6px>sequential = flow context chains across recordings (later steps see earlier extract/ai_extract outputs)</div>
+    <button onclick=runSuite()>Run suite</button>
+    <div class=meta style=margin-top:8px;line-height:1.5">sequential = flow context chains across recordings (later steps see earlier extract/ai_extract outputs)</div>
   </div>`;
 }
 const EDITORS=[];
-function makeEditor(id,mode,height){
-  const ta=document.getElementById(id);
-  if(!window.CodeMirror)return ta; // offline / CDN blocked → plain textarea still works
-  const cm=CodeMirror.fromTextArea(ta,{mode,theme:'dracula',lineNumbers:true,lineWrapping:true,matchBrackets:true,autoCloseBrackets:true,tabSize:2,indentUnit:2});
-  cm.setSize('100%',height);
-  EDITORS.push(cm);
-  return {get value(){return cm.getValue()},set value(v){cm.setValue(v==null?'':String(v))},_cm:cm};
+function countLines(text){return String(text||'').split('\\n').length}
+function setParamsStatus(message,tone){
+  const pill=document.getElementById('paramsStatus');
+  if(!pill)return;
+  pill.textContent=message||'';
+  pill.style.display=message?'inline-block':'none';
+  pill.style.color=tone==='bad'?'var(--bad)':'var(--mut)';
 }
-function refreshEditors(){EDITORS.forEach(cm=>setTimeout(()=>cm.refresh(),0))}
-function formatParams(){const s=document.getElementById('paramsStatus');
-  try{const p=JSON.parse(paramsInput.value);paramsInput.value=JSON.stringify(p,null,2);s.textContent='valid JSON';s.style.color='var(--ok)'}
-  catch(e){s.textContent='invalid JSON: '+e.message;s.style.color='var(--bad)'}}
+function buildEditorChrome(ta,height,opts){
+  const shell=document.createElement('div');
+  shell.className='editor-shell plain';
+  const head=document.createElement('div');
+  head.className='editor-head';
+  head.innerHTML=`<div class=editor-head-left><span class=editor-kind>${opts.title}</span>${opts.hint?`<span class=editor-hint>${opts.hint}</span>`:''}</div><div class=editor-head-right>${opts.actionsHtml||''}${opts.json?'<span id="paramsStatus" class="editor-json-status"></span>':''}<span class=editor-status></span></div>`;
+  const status=head.querySelector('.editor-status');
+  const pane=document.createElement('div');
+  pane.className='editor-pane';
+  const gutter=document.createElement('div');
+  gutter.className='editor-gutter';
+  const parent=ta.parentNode;
+  parent.insertBefore(shell,ta);
+  shell.appendChild(head);
+  shell.appendChild(pane);
+  pane.appendChild(gutter);
+  pane.appendChild(ta);
+  ta.classList.add('code-fallback');
+  ta.spellcheck=false;
+  ta.wrap='off';
+  ta.style.height=height+'px';
+  return {shell,status,gutter,textarea:ta};
+}
+function orderedSelectionRange(range){
+  return CodeMirror.cmpPos(range.anchor,range.head) <= 0 ? {anchor:range.anchor,head:range.head,from:range.anchor,to:range.head} : {anchor:range.anchor,head:range.head,from:range.head,to:range.anchor};
+}
+function selectNextOccurrence(cm){
+  let query=cm.getSelection();
+  if(!query){
+    const word=cm.findWordAt(cm.getCursor());
+    if(CodeMirror.cmpPos(word.anchor,word.head)===0)return;
+    cm.setSelection(word.anchor,word.head);
+    query=cm.getSelection();
+    if(!query)return;
+  }
+  const ranges=cm.listSelections().map(orderedSelectionRange).sort((a,b)=>CodeMirror.cmpPos(a.from,b.from));
+  const last=ranges[ranges.length-1];
+  let cursor=cm.getSearchCursor(query,last.to);
+  let found=cursor.findNext();
+  if(!found){
+    cursor=cm.getSearchCursor(query,CodeMirror.Pos(0,0));
+    found=cursor.findNext();
+  }
+  if(!found)return;
+  const next={anchor:cursor.from(),head:cursor.to()};
+  const duplicate=ranges.some(range=>CodeMirror.cmpPos(range.from,next.anchor)===0&&CodeMirror.cmpPos(range.to,next.head)===0);
+  if(duplicate)return;
+  cm.setSelections(cm.listSelections().concat([next]));
+  cm.scrollIntoView({from:next.anchor,to:next.head},60);
+}
+function renderLineNumbers(gutter,text){
+  const total=Math.max(1,countLines(text));
+  let html='';
+  for(let i=1;i<=total;i+=1)html+=`<span>${i}</span>`;
+  gutter.innerHTML=html;
+}
+function makeEditor(id,mode,height,opts={}){
+  const ta=document.getElementById(id);
+  const chrome=buildEditorChrome(ta,height,opts);
+  const state={cm:null,onChange:null};
+  function currentValue(){return state.cm?state.cm.getValue():ta.value}
+  function updateMeta(){
+    const value=currentValue();
+    chrome.status.textContent=`${countLines(value)} lines`;
+    if(opts.json){
+      if(!String(value).trim()){
+        chrome.shell.classList.remove('valid','invalid');
+        setParamsStatus('', '');
+        return;
+      }
+      try{
+        JSON.parse(value);
+        chrome.shell.classList.add('valid');
+        chrome.shell.classList.remove('invalid');
+        setParamsStatus('', '');
+      }catch(e){
+        chrome.shell.classList.add('invalid');
+        chrome.shell.classList.remove('valid');
+        setParamsStatus('invalid JSON: '+e.message,'bad');
+      }
+    }
+  }
+  function notifyChange(){
+    updateMeta();
+    if(state.onChange)state.onChange(currentValue());
+  }
+  if(window.CodeMirror){
+    chrome.shell.classList.remove('plain');
+    chrome.shell.classList.add('cm-enhanced');
+    const cm=CodeMirror.fromTextArea(ta,{mode,theme:'dracula',lineNumbers:true,lineWrapping:false,matchBrackets:true,autoCloseBrackets:true,styleActiveLine:true,showCursorWhenSelecting:true,tabSize:2,indentUnit:2,extraKeys:{'Tab':cm=>cm.execCommand('insertSoftTab'),'Shift-Tab':'indentLess','Cmd-D':selectNextOccurrence,'Ctrl-D':selectNextOccurrence}});
+    cm.setSize('100%',height);
+    cm.on('change',notifyChange);
+    state.cm=cm;
+  }else{
+    renderLineNumbers(chrome.gutter,ta.value);
+    ta.addEventListener('input',()=>{renderLineNumbers(chrome.gutter,ta.value);notifyChange()});
+    ta.addEventListener('scroll',()=>{chrome.gutter.scrollTop=ta.scrollTop});
+    ta.addEventListener('keydown',e=>{
+      if(e.key!=='Tab')return;
+      e.preventDefault();
+      const start=ta.selectionStart||0;
+      const end=ta.selectionEnd||0;
+      ta.setRangeText('  ',start,end,'end');
+      ta.dispatchEvent(new Event('input'));
+    });
+  }
+  const api={
+    get value(){return currentValue()},
+    set value(v){
+      const next=v==null?'':String(v);
+      if(state.cm)state.cm.setValue(next);
+      else{
+        ta.value=next;
+        renderLineNumbers(chrome.gutter,next);
+      }
+      updateMeta();
+    },
+    refresh(){if(state.cm)state.cm.refresh()},
+    focus(){if(state.cm)state.cm.focus();else ta.focus()},
+    setOnChange(fn){state.onChange=fn},
+  };
+  EDITORS.push(api);
+  updateMeta();
+  return api;
+}
+function refreshEditors(){EDITORS.forEach(editor=>setTimeout(()=>editor.refresh(),0))}
+function formatParams(){
+  try{
+    const parsed=JSON.parse(paramsInput.value);
+    paramsInput.value=JSON.stringify(parsed,null,2);
+    setParamsStatus('', '');
+  }catch(e){
+    setParamsStatus('invalid JSON: '+e.message,'bad');
+  }
+}
 const recordingNameInput=document.getElementById('name');
-const scriptInput=makeEditor('py','python',330);
-const paramsInput=makeEditor('params',{name:'javascript',json:true},190);
+const scriptInput=makeEditor('py','python',620,{title:'Python Script',hint:''});
+const paramsInput=makeEditor('params',{name:'javascript',json:true},620,{title:'Runtime JSON',hint:'',json:true,actionsHtml:'<div class="editor-icon-actions"><button id="downloadParamsBtn" class="ghost editor-icon-btn" type=button onclick="downloadParamsXlsx()" title="Download XLSX" aria-label="Download XLSX">↓</button><button class="ghost editor-icon-btn" type=button onclick="formatParams()" title="Format JSON" aria-label="Format JSON">{}</button></div>'});
 const promptInput=document.getElementById('prompt');
 const repeatableLineItemsEnabledInput=document.getElementById('repeatableLineItemsEnabled');
 const repeatableLineItemsFields=document.getElementById('repeatableLineItemsFields');
-const repeatableLineItemsSheetInput=document.getElementById('repeatableLineItemsSheet');
-const repeatableLineItemsMatchKeyInput=document.getElementById('repeatableLineItemsMatchKey');
-const repeatableLineItemsPromptInput=document.getElementById('repeatableLineItemsPrompt');
 const uploadMessage=document.getElementById('upmsg');
-const paramsFormatSelect=document.getElementById('fmt');
 const overwriteSelect=document.getElementById('ov');
 const runNameLabel=document.getElementById('runName');
 const runMetaLabel=document.getElementById('runMeta');
@@ -1357,29 +1608,95 @@ const reportActions=document.getElementById('reportActions');
 const openReportBtn=document.getElementById('openReportBtn');
 const downloadReportBtn=document.getElementById('downloadReportBtn');
 const reportMeta=document.getElementById('reportMeta');
+const runTabsTray=document.getElementById('runTabs');
+const runPane=document.getElementById('runPane');
+const runEmpty=document.getElementById('runEmpty');
+const runTabCount=document.getElementById('runTabCount');
 const scriptSearchInput=document.getElementById('scriptSearch');
+const downloadParamsBtn=document.getElementById('downloadParamsBtn');
 async function j(u,o){const r=await fetch(u,o);const t=await r.text();let d;try{d=JSON.parse(t)}catch(e){throw new Error(t)}if(!r.ok)throw new Error(d.detail||t);return d}
-function tab(n){for(const x of['edit','run']){document.getElementById('p-'+x).style.display=x==n?'':'none';document.getElementById('t-'+x).classList.toggle('on',x==n)}if(n=='edit')refreshEditors()}
-function resetReportActions(){reportActions.style.display='none';openReportBtn.href='#';downloadReportBtn.href='#';reportMeta.textContent=''}
+function tab(n){
+  for(const x of['edit','run'])document.getElementById('p-'+x).style.display=x==n?'':'none';
+  document.getElementById('side-edit').classList.toggle('on',n==='edit');
+  document.getElementById('side-run').classList.toggle('on',n==='run');
+  if(n==='edit')refreshEditors();
+  if(n==='run')renderRunTabs();
+}
+function resetReportActions(){reportActions.style.display='none';openReportBtn.href='#';downloadReportBtn.href='#';downloadReportBtn.removeAttribute('download');reportMeta.textContent=''}
+function escapeHtml(text){return String(text==null?'':text).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
+function getActiveRunTab(){return RUN_TABS.find(tab=>tab.id===ACTIVE_RUN_TAB_ID)||null}
+function ensureRunTab(id,label){
+  let runTab=RUN_TABS.find(tab=>tab.id===id);
+  if(!runTab){
+    runTab={id,label,message:'',tone:'ok',running:false,meta:'',output:'',reportUrl:'',reportDownload:'',reportMeta:''};
+    RUN_TABS=[runTab].concat(RUN_TABS);
+  }else runTab.label=label;
+  ACTIVE_RUN_TAB_ID=id;
+  renderRunTabs();
+  return runTab;
+}
+function updateRunTab(id,patch){
+  const runTab=RUN_TABS.find(tab=>tab.id===id);
+  if(!runTab)return;
+  Object.assign(runTab,patch);
+  renderRunTabs();
+}
+function selectRunTab(id){ACTIVE_RUN_TAB_ID=id;tab('run');renderRunTabs()}
+function renderRunTabs(){
+  runTabCount.textContent=String(RUN_TABS.length);
+  runTabsTray.innerHTML='';
+  RUN_TABS.forEach(tabState=>{
+    const btn=document.createElement('button');
+    btn.type='button';
+    btn.className='run-tab'+(tabState.id===ACTIVE_RUN_TAB_ID?' on':'');
+    btn.textContent=tabState.label;
+    btn.onclick=()=>selectRunTab(tabState.id);
+    runTabsTray.appendChild(btn);
+  });
+  const active=getActiveRunTab();
+  if(!active){
+    runEmpty.style.display='';
+    runPane.style.display='none';
+    runNameLabel.textContent='—';
+    runMetaLabel.textContent='';
+    runMessage.className='msg';
+    runMessage.textContent='';
+    runOutput.textContent='';
+    resetReportActions();
+    return;
+  }
+  runEmpty.style.display='none';
+  runPane.style.display='';
+  runNameLabel.textContent=active.label;
+  runMetaLabel.textContent=active.meta||'';
+  if(active.message){
+    runMessage.className='msg '+(active.tone||'ok');
+    runMessage.innerHTML=active.running?`${escapeHtml(active.message)} <span class=spin></span>`:escapeHtml(active.message);
+  }else{
+    runMessage.className='msg';
+    runMessage.textContent='';
+  }
+  runOutput.textContent=active.output||'';
+  if(active.reportUrl){
+    reportActions.style.display='flex';
+    openReportBtn.href=active.reportUrl;
+    downloadReportBtn.href=active.reportUrl;
+    if(active.reportDownload)downloadReportBtn.setAttribute('download',active.reportDownload);else downloadReportBtn.removeAttribute('download');
+    reportMeta.textContent=active.reportMeta||'';
+  }else resetReportActions();
+}
 function toggleRepeatableLineItems(){repeatableLineItemsFields.style.display=repeatableLineItemsEnabledInput.checked?'':'none'}
 function buildRepeatableLineItemsPayload(){
   if(!repeatableLineItemsEnabledInput.checked)return null;
-  return {
-    enabled:true,
-    sheet_name:(repeatableLineItemsSheetInput.value||'').trim()||'multi_line',
-    match_key:(repeatableLineItemsMatchKeyInput.value||'').trim(),
-    prompt:(repeatableLineItemsPromptInput.value||'').trim(),
-  };
+  // Sheet name and match key are fixed conventions; the loop instructions come from the Prompt field.
+  return {enabled:true,sheet_name:'line_items',match_key:'ref_id',prompt:(promptInput.value||'').trim()};
 }
 function applyRecordingConfig(config){
   const prompt=(config&&typeof config.prompt=='string')?config.prompt:'';
   const repeatableBlocks=(config&&Array.isArray(config.repeatable_blocks))?config.repeatable_blocks:[];
   const repeatable=repeatableBlocks.length&&typeof repeatableBlocks[0]=='object'?repeatableBlocks[0]:((config&&config.repeatable_line_items&&typeof config.repeatable_line_items=='object')?config.repeatable_line_items:null);
-  promptInput.value=prompt;
+  promptInput.value=prompt||((repeatable&&repeatable.prompt)||'');
   repeatableLineItemsEnabledInput.checked=!!(repeatable&&repeatable.enabled!==false);
-  repeatableLineItemsSheetInput.value=(repeatable&&repeatable.sheet_name)||'multi_line';
-  repeatableLineItemsMatchKeyInput.value=(repeatable&&repeatable.match_key)||'';
-  repeatableLineItemsPromptInput.value=(repeatable&&repeatable.prompt)||'';
   toggleRepeatableLineItems();
 }
 async function loadCfg(){CFG=await j('/api/config');document.getElementById('cfg').textContent=`bucket: ${CFG.bucket} · pg: ${CFG.pg.host}:${CFG.pg.port}/${CFG.pg.db} · agent: local`;waitMsInput.value=String(CFG.default_after_action_wait_ms ?? 0)}
@@ -1387,26 +1704,51 @@ function renderScripts(){
   const query=(scriptSearchInput.value||'').trim().toLowerCase();
   const visible=ALL_SCRIPTS.filter(s=>!query||s.name.toLowerCase().includes(query));
   document.getElementById('count').textContent=`${visible.length}/${ALL_SCRIPTS.length} in ${CFG.bucket||''}`.trim();
-  document.getElementById('list').innerHTML=visible.map(s=>`<div class="script ${inSuite(s.name)?'sel':''}"><div style="display:flex;gap:9px;align-items:center;min-width:0">
+  document.getElementById('list').innerHTML=visible.map(s=>`<div class="script ${inSuite(s.name)?'sel':''}">
+   <div class=script-main><div class=script-top>
    <input type=checkbox class=suitechk title="add to suite" ${inSuite(s.name)?'checked':''} onchange="toggleSuite('${s.name}',this.checked)">
-   <div style=min-width:0><div class=nm>${s.name}</div>
-   <div class=sub>${s.params_key?s.params_key.split('/').pop():'(no params)'} · <span class="badge ${s.has_db?'db':'nodb'}">${s.has_db?'DB ✓':'no DB'}</span></div></div></div>
-   <div style=display:flex;gap:6px;flex-direction:column><button onclick="runIt('${s.name}')">▶ Run</button><button class=ghost onclick="loadOne('${s.name}')">edit</button></div></div>`).join('')||'<div class=meta>no recordings</div>'}
+   <div class=script-copy><div class=nm>${s.name}</div>
+   <div class=sub>${s.params_key?s.params_key.split('/').pop():'(no params)'} · <span class="badge ${s.has_db?'db':'nodb'}">${s.has_db?'DB ✓':'no DB'}</span></div></div></div></div>
+   <div class=script-actions><button class=script-btn onclick="runIt('${s.name}')">Run</button><button class="script-btn ghost" onclick="loadOne('${s.name}')">Edit</button></div></div>`).join('')||'<div class=meta>no recordings</div>'}
 async function loadScripts(){const d=await j('/api/scripts');ALL_SCRIPTS=d.scripts||[];if(!CFG.bucket)CFG.bucket=d.bucket||'';renderScripts();renderSuite()}
 async function loadOne(n){const d=await j('/api/script?name='+encodeURIComponent(n));recordingNameInput.value=d.name;scriptInput.value=d.py_text;
   const payload={params:d.params.length?d.params:[{}]};if(Array.isArray(d.multi_line)&&d.multi_line.length)payload.multi_line=d.multi_line;
   paramsInput.value=JSON.stringify(payload,null,2);applyRecordingConfig(d.recording_config||{});tab('edit');
   uploadMessage.className='msg ok';uploadMessage.textContent=`loaded ${d.name} · placeholders: ${d.placeholders.join(', ')||'none'} · DB: ${d.db?'yes':'no'}`}
-function clearForm(){recordingNameInput.value=scriptInput.value=paramsInput.value=promptInput.value=repeatableLineItemsPromptInput.value=repeatableLineItemsMatchKeyInput.value='';repeatableLineItemsEnabledInput.checked=false;repeatableLineItemsSheetInput.value='multi_line';toggleRepeatableLineItems();uploadMessage.className='msg'}
+function clearForm(){recordingNameInput.value=scriptInput.value=paramsInput.value=promptInput.value='';repeatableLineItemsEnabledInput.checked=false;toggleRepeatableLineItems();uploadMessage.className='msg'}
 async function doUpload(){const b=document.getElementById('upbtn');b.disabled=true;uploadMessage.className='msg';uploadMessage.textContent='';
-  try{let p;try{p=JSON.parse(paramsInput.value)}catch(e){throw new Error('params JSON invalid: '+e.message)}
-   const d=await j('/api/upload',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:recordingNameInput.value,script:scriptInput.value,params:p,fmt:paramsFormatSelect.value,overwrite:overwriteSelect.value=='true',prompt:promptInput.value,repeatable_blocks:(()=>{const block=buildRepeatableLineItemsPayload();return block?[block]:null;})()})});
+  try{let p;try{p=JSON.parse(paramsInput.value)}catch(e){setParamsStatus('invalid JSON: '+e.message,'bad');paramsInput.focus();return}
+   const d=await j('/api/upload',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:recordingNameInput.value,script:scriptInput.value,params:p,fmt:'xlsx',overwrite:overwriteSelect.value=='true',prompt:promptInput.value,repeatable_blocks:(()=>{const block=buildRepeatableLineItemsPayload();return block?[block]:null;})()})});
    let m=`uploaded → ${d.py_key} + ${d.params_key.split('/').pop()} · start_url=${d.start_url||'?'} · DB ${d.db.inserted?'inserted':(d.db.conflict?'conflict':'updated')} (id ${d.db.id||'-'})`;
    if(d.recording_config_key)m+=` · config: ${d.recording_config_key.split('/').pop()}`;
    if(d.db_error)m+=` · ⚠ DB: ${d.db_error}`;if(d.missing_placeholders.length)m+=` · ⚠ missing params for: ${d.missing_placeholders.join(', ')}`;
    uploadMessage.className='msg '+(d.db_error?'err':'ok');uploadMessage.textContent=m;loadScripts()}
   catch(e){uploadMessage.className='msg err';uploadMessage.textContent=e.message}finally{b.disabled=false}}
 function safeName(v){return (v||'').trim().replace(/[^A-Za-z0-9._-]+/g,'_').replace(/^[._]+|[._]+$/g,'')}
+async function downloadParamsXlsx(){
+  let payload;
+  try{payload=JSON.parse(paramsInput.value)}catch(e){setParamsStatus('invalid JSON: '+e.message,'bad');paramsInput.focus();return}
+  const original=downloadParamsBtn.textContent;
+  downloadParamsBtn.disabled=true;
+  downloadParamsBtn.textContent='Preparing...';
+  try{
+    const d=await j('/api/params-xlsx',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:recordingNameInput.value||'recording_name',params:payload})});
+    const a=document.createElement('a');
+    a.href=d.download_url;
+    a.download=d.download_name||'params_preview.xlsx';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    uploadMessage.className='msg ok';
+    uploadMessage.textContent=`download ready → ${d.download_name}`;
+  }catch(e){
+    uploadMessage.className='msg err';
+    uploadMessage.textContent=e.message;
+  }finally{
+    downloadParamsBtn.disabled=false;
+    downloadParamsBtn.textContent=original;
+  }
+}
 async function runIt(n){tab('run');resetReportActions();runNameLabel.textContent=n;runMessage.className='msg ok';runMessage.innerHTML='running <span class=spin></span> (uses your local agent; may take minutes)';
   const waitValue=Number(waitMsInput.value||0);
   runMetaLabel.textContent=`mode=${executionModeSelect.value} · wait=${waitValue}ms`;
@@ -1440,6 +1782,8 @@ async function runSuite(){
   catch(e){runMessage.className='msg err';runMessage.textContent=e.message;runOutput.textContent=e.message}}
 scriptSearchInput.addEventListener('input', renderScripts);
 toggleRepeatableLineItems();
+renderRunTabs();
+tab('edit');
 loadCfg();loadScripts();
 </script></body></html>"""
 
