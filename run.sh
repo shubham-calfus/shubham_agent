@@ -11,8 +11,8 @@
 # Workers run in the background (logs under .run_logs/); the UI runs in the
 # foreground. Ctrl-C stops all three.
 #
-# Usage:  ./run.sh            # UI on the default dedicated port 8765
-#         PORT=8780 ./run.sh  # override the UI port
+# Usage:  ./run            # UI on the default dedicated port 8765
+#         PORT=8780 ./run  # override the UI port
 set -uo pipefail  # NOT -e: pkill returns non-zero when nothing matches, which is fine
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -33,7 +33,12 @@ pkill -f "$ACT_AGENT_DIR/.venv/bin/aetherion run" 2>/dev/null || true
 pkill -f "shubham_agent/app.py" 2>/dev/null || true
 # Free the dedicated UI port in case something else is still holding it.
 PORT_PIDS="$(lsof -ti "tcp:$PORT" 2>/dev/null || true)"
-[ -n "$PORT_PIDS" ] && kill $PORT_PIDS 2>/dev/null || true
+if [ -n "$PORT_PIDS" ]; then
+  kill $PORT_PIDS 2>/dev/null || true
+  sleep 1
+  STILL_PORT_PIDS="$(lsof -ti "tcp:$PORT" 2>/dev/null || true)"
+  [ -n "$STILL_PORT_PIDS" ] && kill -9 $STILL_PORT_PIDS 2>/dev/null || true
+fi
 sleep 1
 
 PIDS=()

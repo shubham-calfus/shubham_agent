@@ -21,7 +21,7 @@ What it does:
 
 ```bash
 cd act-v2
-./agent_shubham/run.sh
+./agent_shubham/run
 # or: act_agent/.venv/bin/python agent_shubham/app.py
 ```
 Open http://localhost:8765 . Make sure your local `ACT Agent` worker is running in a

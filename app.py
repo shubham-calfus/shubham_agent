@@ -589,7 +589,7 @@ def get_script(name: str, bucket: str = ""):
     db = db_rows_by_name([safe]).get(safe)
     return {"name": safe, "py_key": py_key, "py_text": py_text, "params_key": params_key,
             "params": params_rows, "placeholders": _placeholders(py_text), "db": db,
-            "recording_config": recording_config, "line_items": multi_line_rows}
+            "recording_config": recording_config, "line_items": multi_line_rows, "multi_line": multi_line_rows}
 
 
 def _parse_params_back(raw: bytes, ext: str) -> list[dict[str, str]]:
@@ -790,7 +790,7 @@ def upload(body: UploadBody):
         )
         params_bytes, ext, ct = build_params_xlsx(
             param_sets,
-            multi_line_rows=multi_line_rows if repeatable_blocks else None,
+            multi_line_rows=multi_line_rows if multi_line_rows else None,
             multi_line_sheet_name=multi_line_sheet_name,
             match_key=match_key,
         ), "_params.xlsx", \
@@ -1225,7 +1225,7 @@ def get_config():
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTML
+    return HTMLResponse(HTML, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0"})
 
 
 def _find_available_port(preferred_port: int, host: str = "127.0.0.1", *, attempts: int = 20) -> int:
@@ -1242,7 +1242,7 @@ def _find_available_port(preferred_port: int, host: str = "127.0.0.1", *, attemp
     )
 
 
-HTML = """<!doctype html><html><head><meta charset=utf-8><title>agent_shubham</title>
+HTML = """<!doctype html><html><head><meta charset=utf-8><meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0"><title>agent_shubham</title>
 <style>
 :root{--bg:#0f1117;--bg-soft:#12141b;--panel:#171a22;--panel-2:#141821;--line:#262b36;--line-strong:#39507d;--fg:#e6e9ef;--mut:#8b93a7;--acc:#4f8cff;--acc-2:#6b98ff;--ok:#36c98a;--bad:#ff6b6b;--shadow:0 14px 30px rgba(0,0,0,.22)}
 *{box-sizing:border-box}
@@ -1712,7 +1712,7 @@ function renderScripts(){
    <div class=script-actions><button class=script-btn onclick="runIt('${s.name}')">Run</button><button class="script-btn ghost" onclick="loadOne('${s.name}')">Edit</button></div></div>`).join('')||'<div class=meta>no recordings</div>'}
 async function loadScripts(){const d=await j('/api/scripts');ALL_SCRIPTS=d.scripts||[];if(!CFG.bucket)CFG.bucket=d.bucket||'';renderScripts();renderSuite()}
 async function loadOne(n){const d=await j('/api/script?name='+encodeURIComponent(n));recordingNameInput.value=d.name;scriptInput.value=d.py_text;
-  const payload={params:d.params.length?d.params:[{}]};if(Array.isArray(d.multi_line)&&d.multi_line.length)payload.multi_line=d.multi_line;
+  const payload={params:d.params.length?d.params:[{}]};const lineItems=Array.isArray(d.line_items)?d.line_items:(Array.isArray(d.multi_line)?d.multi_line:[]);if(lineItems.length)payload.line_items=lineItems;
   paramsInput.value=JSON.stringify(payload,null,2);applyRecordingConfig(d.recording_config||{});tab('edit');
   uploadMessage.className='msg ok';uploadMessage.textContent=`loaded ${d.name} · placeholders: ${d.placeholders.join(', ')||'none'} · DB: ${d.db?'yes':'no'}`}
 function clearForm(){recordingNameInput.value=scriptInput.value=paramsInput.value=promptInput.value='';repeatableLineItemsEnabledInput.checked=false;toggleRepeatableLineItems();uploadMessage.className='msg'}
@@ -1749,37 +1749,73 @@ async function downloadParamsXlsx(){
     downloadParamsBtn.textContent=original;
   }
 }
-async function runIt(n){tab('run');resetReportActions();runNameLabel.textContent=n;runMessage.className='msg ok';runMessage.innerHTML='running <span class=spin></span> (uses your local agent; may take minutes)';
+async function runIt(n){
+  const tabId=`recording:${n}`;
+  ensureRunTab(tabId,n);
+  tab('run');
+  resetReportActions();
   const waitValue=Number(waitMsInput.value||0);
-  runMetaLabel.textContent=`mode=${executionModeSelect.value} · wait=${waitValue}ms`;
-  runOutput.textContent='$ aetherion agent "ACT Agent" ... --wait\\n(waiting for your local worker)';
+  updateRunTab(tabId,{
+    message:'running (uses your local agent; may take minutes)',
+    tone:'ok',
+    running:true,
+    meta:`mode=${executionModeSelect.value} · wait=${waitValue}ms`,
+    output:'$ aetherion agent "ACT Agent" ... --wait\\n(waiting for your local worker)',
+    reportUrl:'',
+    reportDownload:'',
+    reportMeta:''
+  });
   try{const body={name:n,execution_mode:executionModeSelect.value,after_action_wait_ms:waitValue};
    if(safeName(recordingNameInput.value)===n&&paramsInput.value.trim()){let p;try{p=JSON.parse(paramsInput.value)}catch(e){throw new Error('params JSON invalid: '+e.message)};body.parameters=p}
    const d=await j('/api/run',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-   runMessage.className='msg '+(d.ok?'ok':'err');let m=d.ok?'completed (exit 0)':'failed (exit '+d.returncode+')';
+   let m=d.ok?'completed (exit 0)':'failed (exit '+d.returncode+')';
    if(d.prepared_recording_count&&d.prepared_recording_count>1)m+=` · expanded to ${d.prepared_recording_count} prepared runs`;
    if(d.inline_parameter_keys&&d.inline_parameter_keys.length)m+=` · inline params: ${d.inline_parameter_keys.join(', ')}`;
-   if(d.report_local)m+=' · report: '+d.report_local;runMessage.textContent=m;
-   runMetaLabel.textContent=`mode=${d.execution_mode} · wait=${d.used_after_action_wait_ms}ms`;
-   if(d.report_url){openReportBtn.href=d.report_url;downloadReportBtn.href=d.report_url;downloadReportBtn.setAttribute('download', d.report_url.split('/').pop());reportActions.style.display='flex';reportMeta.textContent=d.report_local||d.report_key||''}
-   runOutput.textContent=(d.stdout||'')+(d.stderr?'\\n--- stderr ---\\n'+d.stderr:'')}
-  catch(e){runMessage.className='msg err';runMessage.textContent=e.message;runOutput.textContent=e.message}}
+   if(d.report_local)m+=' · report: '+d.report_local;
+   updateRunTab(tabId,{
+     message:m,
+     tone:d.ok?'ok':'err',
+     running:false,
+     meta:`mode=${d.execution_mode} · wait=${d.used_after_action_wait_ms}ms`,
+     output:(d.stdout||'')+(d.stderr?'\\n--- stderr ---\\n'+d.stderr:''),
+     reportUrl:d.report_url||'',
+     reportDownload:d.report_url?d.report_url.split('/').pop():'',
+     reportMeta:d.report_local||d.report_key||''
+   })}
+  catch(e){updateRunTab(tabId,{message:e.message,tone:'err',running:false,output:e.message})}}
 async function runSuite(){
   if(!SUITE.length)return;
-  tab('run');resetReportActions();
-  runNameLabel.textContent='Suite: '+SUITE.join(' → ');
-  runMessage.className='msg ok';runMessage.innerHTML='running suite <span class=spin></span> (uses your local agent; may take minutes)';
-  runMetaLabel.textContent=`mode=${SUITE_MODE} · ${SUITE.length} recordings · wait=${SUITE_WAIT}ms`;
-  runOutput.textContent='$ aetherion agent "ACT Agent" ... --wait\\n(waiting for your local worker)';
+  const label='Suite: '+SUITE.join(' → ');
+  const tabId='suite:'+SUITE.join('|');
+  ensureRunTab(tabId,label);
+  tab('run');
+  resetReportActions();
+  updateRunTab(tabId,{
+    message:'running suite (uses your local agent; may take minutes)',
+    tone:'ok',
+    running:true,
+    meta:`mode=${SUITE_MODE} · ${SUITE.length} recordings · wait=${SUITE_WAIT}ms`,
+    output:'$ aetherion agent "ACT Agent" ... --wait\\n(waiting for your local worker)',
+    reportUrl:'',
+    reportDownload:'',
+    reportMeta:''
+  });
   try{const body={recordings:SUITE.map(n=>({name:n})),execution_mode:SUITE_MODE,after_action_wait_ms:SUITE_WAIT};
    const d=await j('/api/run-suite',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-   runMessage.className='msg '+(d.ok?'ok':'err');
    let m=d.ok?'suite completed (exit 0)':'suite failed (exit '+d.returncode+')';
-   m+=` · ${(d.recordings||[]).length} recordings`;if(d.report_local)m+=' · report: '+d.report_local;runMessage.textContent=m;
-   runMetaLabel.textContent=`suite=${d.suite_id} · mode=${d.execution_mode} · wait=${d.used_after_action_wait_ms}ms`;
-   if(d.report_url){openReportBtn.href=d.report_url;downloadReportBtn.href=d.report_url;downloadReportBtn.setAttribute('download', d.report_url.split('/').pop());reportActions.style.display='flex';reportMeta.textContent=d.report_local||d.report_key||''}
-   runOutput.textContent=(d.stdout||'')+(d.stderr?'\\n--- stderr ---\\n'+d.stderr:'')}
-  catch(e){runMessage.className='msg err';runMessage.textContent=e.message;runOutput.textContent=e.message}}
+   m+=` · ${(d.recordings||[]).length} recordings`;
+   if(d.report_local)m+=' · report: '+d.report_local;
+   updateRunTab(tabId,{
+     message:m,
+     tone:d.ok?'ok':'err',
+     running:false,
+     meta:`suite=${d.suite_id} · mode=${d.execution_mode} · wait=${d.used_after_action_wait_ms}ms`,
+     output:(d.stdout||'')+(d.stderr?'\\n--- stderr ---\\n'+d.stderr:''),
+     reportUrl:d.report_url||'',
+     reportDownload:d.report_url?d.report_url.split('/').pop():'',
+     reportMeta:d.report_local||d.report_key||''
+   })}
+  catch(e){updateRunTab(tabId,{message:e.message,tone:'err',running:false,output:e.message})}}
 scriptSearchInput.addEventListener('input', renderScripts);
 toggleRepeatableLineItems();
 renderRunTabs();
@@ -1790,11 +1826,9 @@ loadCfg();loadScripts();
 
 if __name__ == "__main__":
     host = "127.0.0.1"
-    requested_port = int(os.environ.get("PORT", "8765"))
-    bind_port = _find_available_port(requested_port, host)
-    suffix = "" if bind_port == requested_port else f"  (requested {requested_port} was busy)"
+    port = int(os.environ.get("PORT", "8765"))
     print(
-        f"agent_shubham → http://localhost:{bind_port}   "
-        f"(bucket={BUCKET}, pg={PG['host']}:{PG['port']}/{PG['dbname']}){suffix}"
+        f"agent_shubham → http://localhost:{port}   "
+        f"(bucket={BUCKET}, pg={PG['host']}:{PG['port']}/{PG['dbname']})"
     )
-    uvicorn.run(app, host=host, port=bind_port, log_level="info")
+    uvicorn.run(app, host=host, port=port, log_level="info")
