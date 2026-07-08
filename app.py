@@ -24,6 +24,7 @@ import os
 import re
 import socket
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,33 @@ _ENV = _load_dotenv(TEST_RUNNER_DIR / ".env")
 
 def _cfg(key: str, default: str = "") -> str:
     return (os.environ.get(key) or _ENV.get(key) or default).strip()
+
+
+def _build_local_aetherion_cli_env() -> dict[str, str]:
+    """Force the trigger CLI to use the local repo config instead of ~/.config/aetherion."""
+    env = dict(os.environ)
+    for key, value in _ENV.items():
+        name = str(key or "").strip().upper()
+        if not name or value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            env[name] = text
+
+    cli_home = Path(tempfile.gettempdir()) / "agent_shubham_aetherion_home"
+    cfg_dir = cli_home / ".config" / "aetherion"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg: dict[str, str] = {}
+    target_host = str(env.get("AETHERION_TARGET_HOST") or "").strip()
+    if target_host:
+        cfg["TARGET_HOST"] = target_host
+    namespace = str(env.get("AETHERION_NAMESPACE") or "").strip()
+    if namespace:
+        cfg["NAMESPACE"] = namespace
+    (cfg_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    env["HOME"] = str(cli_home)
+    return env
 
 
 DEFAULT_AFTER_ACTION_WAIT_MS = int(_cfg("DEFAULT_AFTER_ACTION_WAIT_MS", "0") or "0")
@@ -1107,8 +1135,16 @@ def _submit_agent_payload(
         cmd += ["--task-queue", task_queue]
     if not Path(AETHERION_BIN).exists():
         raise HTTPException(400, f"aetherion CLI not found at {AETHERION_BIN}")
+    env = _build_local_aetherion_cli_env()
     try:
-        proc = subprocess.run(cmd, cwd=str(TEST_RUNNER_DIR), capture_output=True, text=True, timeout=2400)
+        proc = subprocess.run(
+            cmd,
+            cwd=str(TEST_RUNNER_DIR),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=2400,
+        )
     except subprocess.TimeoutExpired:
         raise HTTPException(504, "run timed out after 40 min")
     return cmd, proc

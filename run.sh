@@ -21,7 +21,11 @@ AETHERION="$ACT_AGENT_DIR/.venv/bin/aetherion"
 PY="$ACT_AGENT_DIR/.venv/bin/python"
 PORT="${PORT:-8765}"          # dedicated UI port
 LOG_DIR="$HERE/.run_logs"
+LOCAL_AETHERION_HOME="${TMPDIR:-/tmp}/agent_shubham_aetherion_home"
+LOCAL_AETHERION_CFG_DIR="$LOCAL_AETHERION_HOME/.config/aetherion"
 mkdir -p "$LOG_DIR"
+mkdir -p "$LOCAL_AETHERION_CFG_DIR"
+printf '{}\n' > "$LOCAL_AETHERION_CFG_DIR/config.json"
 
 for bin in "$AETHERION" "$PY"; do
   [ -x "$bin" ] || { echo "ERROR: not found/executable: $bin (run 'uv sync' in act)"; exit 1; }
@@ -54,15 +58,15 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "==> Starting ACT Agent worker  (logs: $LOG_DIR/agent.log)"
-( cd "$ACT_AGENT_DIR" && exec "$AETHERION" run --agent ) >"$LOG_DIR/agent.log" 2>&1 &
+( cd "$ACT_AGENT_DIR" && exec env HOME="$LOCAL_AETHERION_HOME" "$AETHERION" run --agent ) >"$LOG_DIR/agent.log" 2>&1 &
 PIDS+=("$!")
 
 echo "==> Starting tool worker       (logs: $LOG_DIR/tool.log)"
-( cd "$ACT_AGENT_DIR" && exec "$AETHERION" run --tool ) >"$LOG_DIR/tool.log" 2>&1 &
+( cd "$ACT_AGENT_DIR" && exec env HOME="$LOCAL_AETHERION_HOME" "$AETHERION" run --tool ) >"$LOG_DIR/tool.log" 2>&1 &
 PIDS+=("$!")
 
 echo "==> Starting shubham_agent UI  →  http://localhost:$PORT   (Ctrl-C stops all three)"
 echo "    tail the workers with:  tail -f $LOG_DIR/agent.log $LOG_DIR/tool.log"
 echo
 # Foreground (no exec) so the EXIT/INT trap fires and tears the workers down with it.
-PORT="$PORT" "$PY" "$HERE/app.py"
+HOME="$LOCAL_AETHERION_HOME" PORT="$PORT" "$PY" "$HERE/app.py"
