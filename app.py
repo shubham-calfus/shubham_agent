@@ -92,8 +92,10 @@ def _build_local_aetherion_cli_env() -> dict[str, str]:
 
 DEFAULT_AFTER_ACTION_WAIT_MS = int(_cfg("DEFAULT_AFTER_ACTION_WAIT_MS", "0") or "0")
 DEFAULT_MULTI_LINE_SHEET_NAME = "line_items"
-# Older recordings/payloads used "multi_line" for the repeatable sheet / row key; still accepted.
-_LEGACY_MULTI_LINE_SHEET_NAME = "multi_line"
+# Fixed column that joins a line-item row to its header row (present in BOTH sheets). Hardcoded,
+# not configurable -- every multi-header repeatable recording links its lines to headers by ref_id
+# (kept in lockstep with the runner's excel_to_json_parse.MATCH_KEY).
+MATCH_KEY = "ref_id"
 
 
 STORAGE_ENDPOINT = _cfg("STORAGE_ENDPOINT", "http://localhost:9000")
@@ -242,13 +244,10 @@ def normalize_param_sets(payload: Any, *, allow_empty: bool = False) -> list[dic
 
 
 def _multi_line_key_in(payload: Any) -> str | None:
-    """Return whichever repeatable-rows key the payload uses (current or legacy), else None."""
+    """Return the repeatable-rows key if the payload uses it, else None."""
     if not isinstance(payload, dict):
         return None
-    for key in (DEFAULT_MULTI_LINE_SHEET_NAME, _LEGACY_MULTI_LINE_SHEET_NAME):
-        if key in payload:
-            return key
-    return None
+    return DEFAULT_MULTI_LINE_SHEET_NAME if DEFAULT_MULTI_LINE_SHEET_NAME in payload else None
 
 
 def _normalize_multi_line_rows(payload: Any) -> list[dict[str, str]]:
@@ -293,7 +292,6 @@ def _payload_without_multi_line(payload: Any) -> Any:
         return payload
     cleaned = dict(payload)
     cleaned.pop(DEFAULT_MULTI_LINE_SHEET_NAME, None)
-    cleaned.pop(_LEGACY_MULTI_LINE_SHEET_NAME, None)
     return cleaned
 
 
@@ -314,12 +312,10 @@ def _normalize_repeatable_block_config(payload: Any) -> dict[str, Any] | None:
         return None
     sheet_name = _safe_name(str(payload.get("sheet_name") or DEFAULT_MULTI_LINE_SHEET_NAME)) or DEFAULT_MULTI_LINE_SHEET_NAME
     prompt = str(payload.get("prompt") or "").strip()
-    match_key = _normalize_match_key(payload.get("match_key"))
     return {
         "enabled": True,
         "sheet_name": sheet_name,
         "prompt": prompt,
-        "match_key": match_key,
     }
 
 
@@ -440,14 +436,13 @@ def build_params_xlsx(
     *,
     multi_line_rows: list[dict[str, str]] | None = None,
     multi_line_sheet_name: str = DEFAULT_MULTI_LINE_SHEET_NAME,
-    match_key: str | None = None,
 ) -> bytes:
     import openpyxl
 
-    # When a repeatable block declares a match key (e.g. "ref_id"), materialize that column in
-    # BOTH sheets so each header row is explicitly linked to its repeated rows: header rows get
-    # 1, 2, 3...; repeated rows keep their own value or default to "1" (the first header).
-    match_key = (match_key or "").strip()
+    # Materialize the fixed ref_id join column in BOTH sheets so each header row is explicitly
+    # linked to its repeated rows: header rows get 1, 2, 3...; repeated rows keep their own value
+    # or default to "1" (the first header).
+    match_key = MATCH_KEY
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -617,7 +612,7 @@ def get_script(name: str, bucket: str = ""):
     db = db_rows_by_name([safe]).get(safe)
     return {"name": safe, "py_key": py_key, "py_text": py_text, "params_key": params_key,
             "params": params_rows, "placeholders": _placeholders(py_text), "db": db,
-            "recording_config": recording_config, "line_items": multi_line_rows, "multi_line": multi_line_rows}
+            "recording_config": recording_config, "line_items": multi_line_rows}
 
 
 def _parse_params_back(raw: bytes, ext: str) -> list[dict[str, str]]:
@@ -811,16 +806,10 @@ def upload(body: UploadBody):
             if isinstance(primary_block, dict)
             else DEFAULT_MULTI_LINE_SHEET_NAME
         )
-        match_key = (
-            str(primary_block.get("match_key") or "")
-            if isinstance(primary_block, dict)
-            else ""
-        )
         params_bytes, ext, ct = build_params_xlsx(
             param_sets,
             multi_line_rows=multi_line_rows if multi_line_rows else None,
             multi_line_sheet_name=multi_line_sheet_name,
-            match_key=match_key,
         ), "_params.xlsx", \
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     else:
@@ -1002,9 +991,6 @@ def _build_recording_entries(
 ) -> list[dict[str, Any]]:
     safe = _safe_name(name)
     py_key = f"recordings/{safe}/{safe}.py"
-    recording_config = _load_recording_config(safe, bucket)
-    repeatable_blocks = _repeatable_blocks_from_recording_config(recording_config)
-    repeatable = repeatable_blocks[0] if repeatable_blocks else None
 
     if parameters:
         inline_multi_line_rows = _normalize_multi_line_rows(parameters)
@@ -1042,12 +1028,7 @@ def _build_recording_entries(
                 }
             )
     else:
-        match_key = _normalize_match_key((repeatable or {}).get("match_key"))
-        if not match_key:
-            raise HTTPException(
-                400,
-                f"{safe}: multiple header rows with repeatable blocks require repeatable_blocks[0].match_key.",
-            )
+        match_key = MATCH_KEY
 
         grouped_lines: dict[str, list[dict[str, str]]] = {}
         for line_index, line_row in enumerate(multi_line_rows, start=1):
@@ -1724,8 +1705,8 @@ function renderRunTabs(){
 function toggleRepeatableLineItems(){repeatableLineItemsFields.style.display=repeatableLineItemsEnabledInput.checked?'':'none'}
 function buildRepeatableLineItemsPayload(){
   if(!repeatableLineItemsEnabledInput.checked)return null;
-  // Sheet name and match key are fixed conventions; the loop instructions come from the Prompt field.
-  return {enabled:true,sheet_name:'line_items',match_key:'ref_id',prompt:(promptInput.value||'').trim()};
+  // Sheet name and the ref_id join column are fixed conventions; the loop instructions come from the Prompt field.
+  return {enabled:true,sheet_name:'line_items',prompt:(promptInput.value||'').trim()};
 }
 function applyRecordingConfig(config){
   const prompt=(config&&typeof config.prompt=='string')?config.prompt:'';
