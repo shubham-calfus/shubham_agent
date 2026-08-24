@@ -25,7 +25,12 @@ export interface RecordingConfig {
   version?: number;
   recording_name?: string;
   prompt?: string;
-  repeatable_blocks?: Array<{ enabled?: boolean; sheet_name?: string; prompt?: string }>;
+  repeatable_blocks?: Array<{
+    enabled?: boolean;
+    sheet_name?: string;
+    match_key?: string;
+    prompt?: string;
+  }>;
 }
 
 export interface ScriptDetail {
@@ -38,6 +43,11 @@ export interface ScriptDetail {
   db: DbRow | null;
   recording_config: RecordingConfig;
   line_items: ParamRow[];
+  // The workbook's ORIGINAL bytes (base64), set only by the platform loader.
+  // Kept so an unedited recording can be staged for the local worker byte for
+  // byte instead of rebuilt from the parsed rows -- a rebuild is not lossless
+  // (see params_b64 in app.py's UploadBody).
+  params_b64?: string;
 }
 
 export interface UploadResult {
@@ -50,6 +60,7 @@ export interface UploadResult {
   param_rows: number;
   missing_placeholders: string[];
   multi_line_row_count: number;
+  params_verbatim?: boolean;
   recording_config_key: string;
   db: { id?: string | null; inserted?: boolean; conflict?: boolean };
   db_error: string;

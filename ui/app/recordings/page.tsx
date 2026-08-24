@@ -9,12 +9,17 @@ import { useStore } from "@/lib/store";
 import { useRecordingSource } from "@/lib/realapi/hooks";
 import { sourceLabel } from "@/lib/realapi/connectionSlice";
 import {
-  useDownloadPlatformFileB64Mutation,
-  useDownloadPlatformFileMutation,
   useGetRecordedFlowsQuery,
   useGetTestSuitesQuery,
   type PlatformRecording,
 } from "@/lib/realapi/realApi";
+import {
+  errText,
+  keyHintsFromSuites,
+  pickStr,
+  platformKeys,
+  usePlatformStaging,
+} from "@/lib/realapi/staging";
 import { setConnection } from "@/lib/realapi/connectionSlice";
 import { useAppDispatch } from "@/lib/realapi/hooks";
 import type { ScriptDetail, ScriptListItem } from "@/lib/types";
@@ -27,16 +32,6 @@ import { IconCopy, IconFilm, IconPlus, IconRefresh, IconSearch } from "@/compone
 const NEW = " new";
 
 // ---- platform → list-row mapping -----------------------------------------
-// recorded-flow-list is the platform's own recorded_flows table, so field names
-// vary by deployment; read the first key that is actually present.
-function pickStr(row: Record<string, unknown>, keys: string[]): string {
-  for (const key of keys) {
-    const value = row[key];
-    if (typeof value === "string" && value) return value;
-  }
-  return "";
-}
-
 function toListItem(flow: PlatformRecording): ScriptListItem {
   const row = flow as Record<string, unknown>;
   return {
@@ -45,46 +40,6 @@ function toListItem(flow: PlatformRecording): ScriptListItem {
     params_key: pickStr(row, ["data_file_path", "data_file_name", "params_key"]),
     has_db: true, // it came out of the platform's recorded_flows table by definition
   };
-}
-
-// recorded-flow-list returns only {id, name, start_url}; test-suite-list is the
-// one endpoint that carries the real storage keys (file_path / data_file_path),
-// so prefer those and fall back to the layout both sides agree on.
-function platformKeys(
-  flow: PlatformRecording | undefined,
-  name: string,
-  fromSuites: Map<string, { file_path: string; data_file_path?: string }>,
-): { script: string; workbook: string } {
-  const row = (flow ?? {}) as Record<string, unknown>;
-  const suite = fromSuites.get(name);
-  const script =
-    suite?.file_path ||
-    pickStr(row, ["file_path", "file_name", "py_key", "script_path", "file"]) ||
-    `recordings/${name}/${name}.py`;
-  return {
-    script,
-    // Derived from the script key rather than guessed separately: if the script
-    // key resolved, its sibling is the best available guess for the workbook.
-    workbook:
-      suite?.data_file_path ||
-      pickStr(row, ["data_file_path", "data_file_name", "params_key"]) ||
-      script.replace(/\.py$/, "_params.xlsx"),
-  };
-}
-
-function errText(err: unknown): string {
-  if (!err) return "";
-  if (typeof err === "string") return err;
-  if (typeof err === "object") {
-    const e = err as { error?: unknown; data?: unknown; status?: unknown };
-    if (typeof e.error === "string") return e.error;
-    if (typeof e.data === "string") return e.data;
-    if (e.data && typeof e.data === "object" && "detail" in e.data) {
-      return String((e.data as { detail: unknown }).detail);
-    }
-    if (e.status !== undefined) return `HTTP ${String(e.status)}`;
-  }
-  return String(err);
 }
 
 function RecordingsInner() {
@@ -135,22 +90,11 @@ function RecordingsInner() {
   const { runSingle } = useRunner();
   const { toggleSuite, inSuite, toast } = useStore();
   const dispatch = useAppDispatch();
-  const [downloadPlatformFile] = useDownloadPlatformFileMutation();
-  const [downloadPlatformFileB64] = useDownloadPlatformFileB64Mutation();
+  const { fetchPlatformFiles } = usePlatformStaging();
 
   // Suites are only fetched to learn each flow's real storage keys.
   const { data: suites } = useGetTestSuitesQuery(undefined, { skip: !fromPlatform });
-  const keysFromSuites = useMemo(() => {
-    const map = new Map<string, { file_path: string; data_file_path?: string }>();
-    for (const suite of suites ?? []) {
-      for (const flow of suite.recorded_flows ?? []) {
-        if (flow.name && flow.file_path) {
-          map.set(flow.name, { file_path: flow.file_path, data_file_path: flow.data_file_path });
-        }
-      }
-    }
-    return map;
-  }, [suites]);
+  const keysFromSuites = useMemo(() => keyHintsFromSuites(suites), [suites]);
 
   // Loader for a PLATFORM recording, shaped exactly like api.script() so the
   // editor cannot tell the difference: pull the .py and the params workbook out
@@ -160,25 +104,12 @@ function RecordingsInner() {
     async (recordingName: string): Promise<ScriptDetail> => {
       const flow = rawByName.get(recordingName);
       const keys = platformKeys(flow, recordingName, keysFromSuites);
-      // No fallbacks: if either file cannot be read, FAIL — loudly, naming the
-      // key. Seeding params from the script's {{placeholders}} looked helpful but
-      // was actively dangerous: those blank values are indistinguishable from a
-      // real template, and saving them would write a wrong workbook into the
-      // local bucket. The try/catch here only attaches the key to the message
-      // before rethrowing; it never swallows.
-      let pyText: string;
-      try {
-        pyText = await downloadPlatformFile({ path: keys.script }).unwrap();
-      } catch (e) {
-        throw new Error(`script not readable — ${keys.script}: ${errText(e)}`);
-      }
-
-      let b64: string;
-      try {
-        b64 = await downloadPlatformFileB64({ path: keys.workbook }).unwrap();
-      } catch (e) {
-        throw new Error(`data template not readable — ${keys.workbook}: ${errText(e)}`);
-      }
+      // No fallbacks: if either file cannot be read this THROWS, naming the key
+      // (see fetchPlatformFiles). Seeding params from the script's
+      // {{placeholders}} looked helpful but was actively dangerous — those blank
+      // values are indistinguishable from a real template, and saving them would
+      // write a wrong workbook into the local bucket.
+      const { script: pyText, workbookB64: b64 } = await fetchPlatformFiles(keys);
       const parsed = await api.parseParams({ filename: keys.workbook, content_b64: b64 });
 
       const row = (flow ?? {}) as Record<string, unknown>;
@@ -197,12 +128,20 @@ function RecordingsInner() {
           data_file_name: keys.workbook,
           start_url: String(row.start_url ?? ""),
         },
-        recording_config: {},
+        // Declare the repeatable sheet the workbook ACTUALLY uses (the ingest
+        // agent names it multi_line; this UI names it line_items), so saving or
+        // staging writes a sidecar the runner can follow.
+        recording_config: parsed.multi_line.length
+          ? { repeatable_blocks: [{ enabled: true, sheet_name: parsed.multi_line_sheet }] }
+          : {},
         line_items: parsed.multi_line,
+        // The workbook exactly as the platform holds it, so an unedited Run
+        // stages a byte-for-byte copy instead of a rebuild (see RecordingEditor).
+        params_b64: b64,
       };
       return detail;
     },
-    [rawByName, keysFromSuites, downloadPlatformFile, downloadPlatformFileB64],
+    [rawByName, keysFromSuites, fetchPlatformFiles],
   );
 
   const filtered = useMemo(() => {

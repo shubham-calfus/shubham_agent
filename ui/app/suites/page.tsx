@@ -8,6 +8,12 @@ import { useStore } from "@/lib/store";
 import { useRecordingSource } from "@/lib/realapi/hooks";
 import { sourceLabel } from "@/lib/realapi/connectionSlice";
 import { useGetTestSuitesQuery } from "@/lib/realapi/realApi";
+import {
+  errText,
+  keyHintsFromSuites,
+  platformKeys,
+  usePlatformStaging,
+} from "@/lib/realapi/staging";
 import type { Suite } from "@/lib/types";
 import { PageHeader, EmptyState, Spinner } from "@/components/ui";
 import { IconFlow, IconPlay, IconRefresh } from "@/components/icons";
@@ -20,22 +26,11 @@ interface SuiteRow {
   members: string[];
 }
 
-function errText(err: unknown): string {
-  if (!err) return "";
-  if (typeof err === "string") return err;
-  if (typeof err === "object") {
-    const e = err as { error?: unknown; data?: unknown; status?: unknown };
-    if (typeof e.error === "string") return e.error;
-    if (typeof e.data === "string") return e.data;
-    if (e.status !== undefined) return `HTTP ${String(e.status)}`;
-  }
-  return String(err);
-}
-
 export default function SuitesPage() {
   const { source, onPlatform } = useRecordingSource();
   const { runSuite } = useRunner();
   const { toast } = useStore();
+  const { stageForLocalRun } = usePlatformStaging();
   const [checking, setChecking] = useState("");
 
   // Local file-DB suites (skipped on a platform source).
@@ -57,6 +52,10 @@ export default function SuitesPage() {
     error: platformError,
     refetch,
   } = useGetTestSuitesQuery(undefined, { skip: !onPlatform });
+
+  // The suite listing is also the only place that reports each member's real
+  // storage keys, so staging reads them straight off it.
+  const keyHints = useMemo(() => keyHintsFromSuites(platformSuites), [platformSuites]);
 
   const rows = useMemo<SuiteRow[]>(() => {
     if (onPlatform) {
@@ -80,9 +79,12 @@ export default function SuitesPage() {
     else reload();
   }, [onPlatform, refetch, reload]);
 
-  // The agent is always local, so every member must exist in the local bucket.
-  // Check first and name what is missing — running a suite that silently skips
-  // recordings would report a green suite that never ran half its steps.
+  // The agent is always local and downloads each recording from the LOCAL
+  // bucket, so every member has to exist there before the suite starts. A
+  // platform member that is missing gets STAGED (objects written, no
+  // recorded_flows row) — the same thing Run does for a single recording.
+  // A member already present is left alone: it may be one you edited locally,
+  // and overwriting it from upstream would silently discard that.
   const runLocally = async (suite: SuiteRow) => {
     if (!suite.members.length) {
       toast("err", `${suite.name} has no recordings`);
@@ -92,16 +94,31 @@ export default function SuitesPage() {
     try {
       const local = new Set((await api.scripts()).scripts.map((s) => s.name));
       const missing = suite.members.filter((name) => !local.has(name));
-      if (missing.length) {
+      if (missing.length && !onPlatform) {
+        // A local suite naming a recording that is not in the bucket is a broken
+        // suite, not something to fetch — there is no upstream to fetch from.
         toast(
           "err",
-          `${suite.name}: ${missing.length} recording(s) not on the local runner — ${missing.join(", ")}. Import them from Recordings first.`,
+          `${suite.name}: ${missing.length} recording(s) not in the local bucket — ${missing.join(", ")}.`,
         );
         return;
       }
+      if (missing.length) {
+        toast("ok", `${suite.name}: staging ${missing.length} recording(s) for the local worker…`);
+        for (const name of missing) {
+          try {
+            await stageForLocalRun(name, platformKeys(undefined, name, keyHints));
+          } catch (e) {
+            // Fail the whole suite: running it with a member missing would
+            // report a green suite that never executed part of the flow.
+            throw new Error(`could not stage ${name} — ${errText(e)}`);
+          }
+        }
+        toast("ok", `${suite.name}: staged ${missing.join(", ")}`);
+      }
       await runSuite(suite.members.map((name) => ({ name })));
     } catch (e) {
-      toast("err", `${suite.name}: ${e instanceof Error ? e.message : String(e)}`);
+      toast("err", `${suite.name}: ${errText(e)}`);
     } finally {
       setChecking("");
     }

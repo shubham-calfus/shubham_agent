@@ -20,6 +20,9 @@ const DEFAULT_PARAMS = `{
   ]
 }`;
 
+// The repeatable sheet name this UI writes when the recording does not name one.
+const DEFAULT_SHEET = "line_items";
+
 // ---------------------------------------------------------------------------
 // The single edit surface for a recording. Used inline in the Recordings page
 // so browsing and editing happen on one screen. Pass initialName="" to author
@@ -63,6 +66,19 @@ export function RecordingEditor({
   const [paramsText, setParamsText] = useState(DEFAULT_PARAMS);
   const [prompt, setPrompt] = useState("");
   const [repeatable, setRepeatable] = useState(false);
+  // The repeatable sheet this recording actually uses. Local recordings use this
+  // UI's own name; one written elsewhere (the ingest agent) may use another, and
+  // rewriting the sidecar with the wrong name would point the runner at a sheet
+  // that is not there.
+  const [sheetName, setSheetName] = useState(DEFAULT_SHEET);
+  // What the loader returned, kept to answer one question: has the user edited
+  // anything? If not, staging can copy the upstream workbook byte for byte
+  // instead of rebuilding it from the parsed rows.
+  const [pristine, setPristine] = useState<{ script: string; params: string; b64: string }>({
+    script: "",
+    params: "",
+    b64: "",
+  });
   const [startUrl, setStartUrl] = useState("");
   const [busy, setBusy] = useState(false);
   const [staging, setStaging] = useState(false);
@@ -82,12 +98,14 @@ export function RecordingEditor({
         setScript(d.py_text);
         const payload: Record<string, unknown> = { params: d.params };
         if (d.line_items.length) payload.line_items = d.line_items;
-        setParamsText(JSON.stringify(payload, null, 2));
+        const paramsJson = JSON.stringify(payload, null, 2);
+        setParamsText(paramsJson);
         setPrompt(d.recording_config?.prompt || "");
-        setRepeatable(
-          (d.recording_config?.repeatable_blocks?.length ?? 0) > 0 || d.line_items.length > 0,
-        );
+        const block = d.recording_config?.repeatable_blocks?.[0];
+        setRepeatable(!!block || d.line_items.length > 0);
+        setSheetName(block?.sheet_name || DEFAULT_SHEET);
         setStartUrl(d.db?.start_url || "");
+        setPristine({ script: d.py_text, params: paramsJson, b64: d.params_b64 || "" });
       })
       .catch((e) => alive && setError(e instanceof Error ? e.message : String(e)))
       .finally(() => alive && setLoadingExisting(false));
@@ -102,6 +120,22 @@ export function RecordingEditor({
     return JSON.parse(text);
   }, [paramsText]);
 
+  const repeatableBlocks = useCallback(
+    () => (repeatable ? [{ enabled: true, sheet_name: sheetName }] : null),
+    [repeatable, sheetName],
+  );
+
+  // The upstream workbook's bytes, but only while the form still matches what
+  // was loaded. Once the user edits the script or the rows, their edits are the
+  // thing to run, so the workbook has to be rebuilt from them.
+  const verbatimParams = useCallback(
+    () =>
+      pristine.b64 && script === pristine.script && paramsText === pristine.params
+        ? pristine.b64
+        : undefined,
+    [pristine, script, paramsText],
+  );
+
   // Returns whether the save succeeded, so "Save & Run" can chain on it.
   const doUpload = async (): Promise<boolean> => {
     setBusy(true);
@@ -115,7 +149,8 @@ export function RecordingEditor({
         params: parsed,
         prompt,
         overwrite,
-        repeatable_blocks: repeatable ? [{ enabled: true, sheet_name: "line_items" }] : null,
+        repeatable_blocks: repeatableBlocks(),
+        params_b64: verbatimParams(),
       });
       setResult(res);
       toast("ok", `Saved ${res.name} · ${res.param_rows} param row(s)`);
@@ -196,11 +231,15 @@ export function RecordingEditor({
                           prompt,
                           overwrite: true,
                           register: false,
-                          repeatable_blocks: repeatable
-                            ? [{ enabled: true, sheet_name: "line_items" }]
-                            : null,
+                          repeatable_blocks: repeatableBlocks(),
+                          params_b64: verbatimParams(),
                         });
-                        toast("ok", `Staged ${res.name} locally · running`);
+                        toast(
+                          "ok",
+                          `Staged ${res.name} locally (${
+                            res.params_verbatim ? "exact copy" : "data template rebuilt from your edits"
+                          }) · running`,
+                        );
                       } catch (e) {
                         const msg = e instanceof Error ? e.message : String(e);
                         setError(msg);

@@ -39,7 +39,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # --------------------------------------------------------------------------- paths / config
 HERE = Path(__file__).resolve().parent
@@ -317,9 +317,16 @@ def _normalize_repeatable_block_config(payload: Any) -> dict[str, Any] | None:
         return None
     sheet_name = _safe_name(str(payload.get("sheet_name") or DEFAULT_MULTI_LINE_SHEET_NAME)) or DEFAULT_MULTI_LINE_SHEET_NAME
     prompt = str(payload.get("prompt") or "").strip()
+    # match_key must survive into the sidecar. The run path joins rows by the
+    # FIXED MATCH_KEY column (the runner hardcodes "ref_id"), so this value does
+    # not steer grouping -- but the recorder collects it from the user, and
+    # dropping it here meant their input vanished with no trace. Safe-named to
+    # the form sheet columns are stored under.
+    match_key = _normalize_match_key(payload.get("match_key"))
     return {
         "enabled": True,
         "sheet_name": sheet_name,
+        "match_key": match_key,
         "prompt": prompt,
     }
 
@@ -674,6 +681,37 @@ def _parse_multi_line_back(
     return parsed
 
 
+# Sheets that are never the repeatable-rows sheet: the header sheet this UI
+# writes, and the legacy flow-context sheet the ingest agent emits.
+_NON_REPEATABLE_SHEETS = {"params", "context", "flow_context"}
+
+
+def _repeatable_sheet_in(raw: bytes) -> str:
+    """The sheet holding repeatable rows in a workbook we did not write.
+
+    Prefer this UI's own sheet name; otherwise take the first sheet that is not
+    the header/context sheet. Guessing beats returning nothing: the workbook may
+    come from the ingest agent (sheet "multi_line") or from a hand-built file,
+    and silently reading zero rows would stage a recording whose repeated block
+    has no data.
+    """
+    import openpyxl
+
+    wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    try:
+        names = list(wb.sheetnames)
+    finally:
+        wb.close()
+    safe = {name: _safe_name(name) for name in names}
+    for name in names:
+        if safe[name] == DEFAULT_MULTI_LINE_SHEET_NAME:
+            return safe[name]
+    for name in names:
+        if safe[name] and safe[name] not in _NON_REPEATABLE_SHEETS:
+            return safe[name]
+    return ""
+
+
 def _load_saved_runtime_payload(name: str, bucket: str) -> tuple[list[dict[str, str]], list[dict[str, str]], str]:
     s3 = _s3()
     safe = _safe_name(name)
@@ -696,6 +734,16 @@ def _load_saved_runtime_payload(name: str, bucket: str) -> tuple[list[dict[str, 
             params_rows = _parse_params_back(raw, ext)
             if ext.endswith(".xlsx"):
                 multi_line_rows = _parse_multi_line_back(raw, sheet_name=multi_line_sheet_name)
+                # A workbook this UI did not write may name its repeatable sheet
+                # anything (the ingest agent uses "multi_line"), and one staged
+                # from the platform arrives with no sidecar naming it at all.
+                # Reading zero rows would run the recording's repeated block with
+                # no data and still report green, so look for the sheet instead of
+                # assuming there is none.
+                if not multi_line_rows:
+                    fallback_sheet = _repeatable_sheet_in(raw)
+                    if fallback_sheet and fallback_sheet != multi_line_sheet_name:
+                        multi_line_rows = _parse_multi_line_back(raw, sheet_name=fallback_sheet)
             break
         except Exception:
             continue
@@ -732,7 +780,20 @@ class UploadBody(BaseModel):
     # Used when the UI only needs the script materialised so the LOCAL worker can
     # execute it (a platform recording being run here); registering it in the
     # library stays an explicit user action.
-    register: bool = True
+    #
+    # Named register_flow internally with the wire name kept as an alias:
+    # BaseModel already has a `register` attribute, and shadowing it makes
+    # pydantic warn on every import.
+    register_flow: bool = Field(default=True, alias="register")
+    # Base64 workbook bytes to store VERBATIM instead of rebuilding one from
+    # `params`. This is for COPYING a recording that already has a workbook (a
+    # platform recording being staged for the local worker). A rebuild is a
+    # round trip through the parser and the writer, which is NOT lossless: it
+    # injects a ref_id column that was not upstream, drops blank cells from the
+    # repeatable sheet, drops any sheet the parser does not read (context), and
+    # depends on having guessed the repeatable sheet's name. A copy just runs
+    # here the way it runs there. Ignored when empty.
+    params_b64: str = ""
 
 
 class ParamsXlsxBody(BaseModel):
@@ -771,6 +832,23 @@ class ParseParamsBody(BaseModel):
     multi_line_sheet: str = ""
 
 
+def _decode_b64(value: str, field: str) -> bytes:
+    try:
+        return base64.b64decode(value, validate=True)
+    except Exception as exc:
+        raise HTTPException(400, f"{field} is not valid base64: {exc}") from exc
+
+
+def _decode_verbatim_params(value: str) -> bytes | None:
+    """The workbook bytes to store as-is, or None when the caller sent none."""
+    if not value:
+        return None
+    raw = _decode_b64(value, "params_b64")
+    if not raw:
+        raise HTTPException(400, "params_b64 decoded to zero bytes")
+    return raw
+
+
 # --------------------------------------------------------------------------- parse an EXISTING workbook
 # The UI can already build a workbook from flat JSON (/api/params-xlsx); this is
 # the other direction, for a workbook it did not build -- e.g. one downloaded
@@ -779,21 +857,23 @@ class ParseParamsBody(BaseModel):
 # uses, so a platform workbook and a local workbook produce identical rows.
 @app.post("/api/parse-params")
 def parse_params(body: ParseParamsBody):
-    try:
-        raw = base64.b64decode(body.content_b64, validate=True)
-    except Exception as exc:
-        raise HTTPException(400, f"content_b64 is not valid base64: {exc}") from exc
+    raw = _decode_b64(body.content_b64, "content_b64")
     ext = "csv" if body.filename.lower().endswith(".csv") else "xlsx"
     try:
         rows = _parse_params_back(raw, ext)
-        lines = (
-            _parse_multi_line_back(raw, sheet_name=body.multi_line_sheet)
-            if body.multi_line_sheet
-            else _parse_multi_line_back(raw)
+        sheet = _safe_name(body.multi_line_sheet) or (
+            "" if ext == "csv" else _repeatable_sheet_in(raw)
         )
+        lines = _parse_multi_line_back(raw, sheet_name=sheet) if sheet else []
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(400, f"could not read the workbook: {exc}") from exc
-    return {"params": rows, "multi_line": lines}
+    # Report WHICH sheet the rows came from: a workbook written elsewhere may
+    # name its repeatable sheet anything, and answering with an empty list
+    # would look like "this recording has no line items" instead of "we read
+    # the wrong sheet".
+    return {"params": rows, "multi_line": lines, "multi_line_sheet": sheet}
 
 
 @app.post("/api/params-xlsx")
@@ -828,19 +908,29 @@ def upload(body: UploadBody):
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     repeatable_blocks = _normalize_repeatable_blocks_config(body.repeatable_blocks)
-    param_sets, multi_line_rows = _resolve_upload_multi_line_rows(
-        payload=payload,
-        param_sets=param_sets,
-        repeatable_blocks=repeatable_blocks,
-        recording_name=name,
-        bucket=bkt,
-        overwrite=body.overwrite,
-    )
+    # A verbatim workbook is stored as-is, so none of the row/sheet resolution
+    # below applies to it -- there is nothing to build.
+    verbatim_params = _decode_verbatim_params(body.params_b64)
+    if verbatim_params is None:
+        param_sets, multi_line_rows = _resolve_upload_multi_line_rows(
+            payload=payload,
+            param_sets=param_sets,
+            repeatable_blocks=repeatable_blocks,
+            recording_name=name,
+            bucket=bkt,
+            overwrite=body.overwrite,
+        )
+    else:
+        multi_line_rows = []
 
     fmt = body.fmt if body.fmt in ("xlsx", "csv") else "xlsx"
     if fmt == "csv" and repeatable_blocks:
         raise HTTPException(400, "repeatable blocks require xlsx because csv cannot store a dedicated repeatable sheet.")
-    if fmt == "xlsx":
+    if verbatim_params is not None:
+        params_bytes = verbatim_params
+        ext = "_params.csv" if fmt == "csv" else "_params.xlsx"
+        ct = "text/csv" if fmt == "csv" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    elif fmt == "xlsx":
         primary_block = repeatable_blocks[0] if repeatable_blocks else None
         multi_line_sheet_name = (
             str(primary_block.get("sheet_name") or DEFAULT_MULTI_LINE_SHEET_NAME)
@@ -881,7 +971,7 @@ def upload(body: UploadBody):
 
     db_error = ""
     db_result: dict[str, Any] = {}
-    if body.register:
+    if body.register_flow:
         try:
             db_result = upsert_recorded_flow(
                 name=name, file_name=py_key, data_file_name=params_key,
@@ -894,8 +984,9 @@ def upload(body: UploadBody):
         "ok": True, "bucket": bkt, "name": name, "py_key": py_key, "params_key": params_key,
         "start_url": start_url, "param_rows": len(param_sets), "missing_placeholders": missing,
         "multi_line_row_count": len(multi_line_rows),
+        "params_verbatim": verbatim_params is not None,
         "recording_config_key": recording_config_key, "recording_config": recording_config,
-        "db": db_result, "db_error": db_error, "registered": body.register,
+        "db": db_result, "db_error": db_error, "registered": body.register_flow,
         "run_cmd": _run_cmd(name, py_key, after_action_wait_ms=DEFAULT_AFTER_ACTION_WAIT_MS),
     }
 
@@ -1078,7 +1169,9 @@ def _build_recording_entries(
             if not line_match_value:
                 raise HTTPException(
                     400,
-                    f"{safe}: multi_line row {line_index} is missing match key '{match_key}'.",
+                    f"{safe}: multi_line row {line_index} has no '{match_key}' value. "
+                    f"Multi-header recordings join rows to headers by the fixed "
+                    f"match_key column '{match_key}' -- add it to both sheets.",
                 )
             grouped_lines.setdefault(line_match_value, []).append(dict(line_row))
 
@@ -1088,7 +1181,9 @@ def _build_recording_entries(
             if not header_match_value:
                 raise HTTPException(
                     400,
-                    f"{safe}: params row {index} is missing match key '{match_key}'.",
+                    f"{safe}: params row {index} has no '{match_key}' value. "
+                    f"Multi-header recordings join rows to headers by the fixed "
+                    f"match_key column '{match_key}' -- add it to both sheets.",
                 )
             if header_match_value in seen_header_values:
                 raise HTTPException(

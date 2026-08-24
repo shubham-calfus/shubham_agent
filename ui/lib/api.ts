@@ -88,6 +88,8 @@ export const api = {
     // false = put the objects in the bucket but skip the recorded_flows upsert
     // (staging a platform recording so the LOCAL worker can execute it).
     register?: boolean;
+    // base64 workbook bytes stored verbatim instead of rebuilt from `params`
+    params_b64?: string;
   }) =>
     req<UploadResult>("/api/upload", {
       method: "POST",
@@ -97,7 +99,7 @@ export const api = {
   // Read an EXISTING workbook (e.g. one downloaded from the platform) back into
   // rows, so its data template can be shown and edited like a local one.
   parseParams: (payload: { filename: string; content_b64: string; multi_line_sheet?: string }) =>
-    req<{ params: ParamRow[]; multi_line: ParamRow[] }>("/api/parse-params", {
+    req<{ params: ParamRow[]; multi_line: ParamRow[]; multi_line_sheet: string }>("/api/parse-params", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
