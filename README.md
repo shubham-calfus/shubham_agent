@@ -3,6 +3,10 @@
 A tiny **local** replica of the ghostwriter ingest + run loop, with a web UI. It does **not**
 own a worker/container — runs go through the agent you already run in your terminal.
 
+The UI is **ACT Studio** — the Next.js app under [`ui/`](ui), served on :3111 and tracked in this
+repo. `app.py` is the API it talks to; its old built-in single-file HTML page was removed, so
+`GET :8765/` now just redirects to the Studio. `./run.sh` starts both.
+
 What it does:
 - **List** recordings stored in MinIO (`recordings/<name>/...`) and show whether each has a
   `recorded_flows` DB row.
@@ -20,12 +24,17 @@ What it does:
 ## Run it
 
 ```bash
-cd act-v2
-./agent_shubham/run
-# or: act_agent/.venv/bin/python agent_shubham/app.py
+cd shubham_agent
+./run.sh                 # workers + API backend :8765 + ACT Studio :3111
+UI=0 ./run.sh            # no Next UI — app.py in the foreground (the old behavior)
+UI_PORT=3200 ./run.sh    # different Studio port
 ```
-Open http://localhost:8765 . Make sure your local `ACT Agent` worker is running in a
-terminal so the **Run** button has something to execute the job.
+
+Open **http://localhost:3111** for ACT Studio (http://localhost:8765 redirects there).
+`./run.sh` also starts the `ACT Agent` + tool workers, so the **Run** button has something to
+execute the job; Ctrl-C tears the whole stack down.
+
+To run the backend alone: `../act/.venv/bin/python app.py`.
 
 ## Config (auto-detected, env-overridable)
 
@@ -37,7 +46,11 @@ terminal so the **Run** button has something to execute the job.
 | `POSTGRES_HOST/PORT/USER/PASSWORD/DB` | `localhost:5435 aetherion/aetherion/aetherion` | local `aetherion-postgresql` container |
 | `USER_ID` | `4562a98e-809c-40e8-bc3c-6426bc5d47aa` | `created_by`/`updated_by` for new rows |
 | `TEST_RUNNER_DIR` | `../act_agent` | where the agent + venv live |
-| `PORT` | `8765` | web UI port |
+| `PORT` | `8765` | API backend port (also the ACT Recorder extension's upload target) |
+| `UI_PORT` | `3111` | ACT Studio (Next.js) port |
+| `UI` | `1` | set `UI=0` to run the API alone in the foreground (no UI at all) |
+| `ACT_STUDIO_URL` | `http://localhost:3111` | where `GET /` redirects; `run.sh` sets it to the port it actually claimed |
+| `ACT_BACKEND_URL` | `http://localhost:8765` | which backend ACT Studio proxies `/api` to |
 
 Override any of these via environment variables before launching.
 

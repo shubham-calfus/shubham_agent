@@ -1,0 +1,330 @@
+@import "tailwindcss";
+
+/* Dark mode is driven by a `data-theme="dark"` attribute on <html>. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* ------------------------------------------------------------------ *
+ * Brand fonts — Stack Sans Notch (display) + DM Sans (body), embedded
+ * locally from the canonical Calfus · aCT brand film. No CDN.
+ * ------------------------------------------------------------------ */
+@font-face {
+  font-family: "Stack Sans Notch";
+  font-style: normal;
+  font-weight: 200 700;
+  font-display: swap;
+  src: url("/fonts/StackSansNotch-normal.ttf") format("truetype");
+}
+@font-face {
+  font-family: "DM Sans";
+  font-style: normal;
+  font-weight: 100 1000;
+  font-display: swap;
+  src: url("/fonts/DMSans-normal.ttf") format("truetype");
+}
+@font-face {
+  font-family: "DM Sans";
+  font-style: italic;
+  font-weight: 100 1000;
+  font-display: swap;
+  src: url("/fonts/DMSans-italic.ttf") format("truetype");
+}
+
+/* ------------------------------------------------------------------ *
+ * Brand tokens. Raw values live on :root (light) and [data-theme=dark].
+ * Teal #3FBFAD is the accent — used as PUNCTUATION, never as fill wash.
+ * ------------------------------------------------------------------ */
+:root {
+  --c-bg: #ffffff;
+  --c-surface: #ffffff;
+  --c-surface-2: #f7f7f5;
+  --c-surface-3: #f1f1ee;
+  --c-line: rgba(10, 10, 10, 0.1);
+  --c-line-2: rgba(10, 10, 10, 0.2);
+
+  --c-ink: #0a0a0a;
+  --c-ink-mid: rgba(10, 10, 10, 0.72);
+  --c-ink-dim: rgba(10, 10, 10, 0.46);
+  --c-ink-faint: rgba(10, 10, 10, 0.3);
+
+  --c-teal: #3fbfad;
+  --c-teal-2: #0e8f83;
+  --c-teal-3: #0a4f48;
+  --c-teal-soft: rgba(63, 191, 173, 0.1);
+
+  --c-good: #0e8f83;
+  --c-good-soft: rgba(14, 143, 131, 0.1);
+  --c-bad: #e0564b;
+  --c-bad-soft: rgba(224, 86, 75, 0.1);
+  --c-warn: #d48a19;
+  --c-warn-soft: rgba(212, 138, 25, 0.12);
+  --c-violet: #8b5cf6;
+  --c-violet-soft: rgba(139, 92, 246, 0.1);
+
+  --dot: rgba(10, 10, 10, 0.085);
+  --shadow-card: 0 1px 2px rgba(10, 10, 10, 0.04), 0 10px 30px rgba(10, 10, 10, 0.06);
+  --shadow-lift: 0 8px 28px rgba(63, 191, 173, 0.16);
+}
+
+[data-theme="dark"] {
+  --c-bg: #0a0a0a;
+  --c-surface: #141414;
+  --c-surface-2: #181818;
+  --c-surface-3: #202020;
+  --c-line: rgba(255, 255, 255, 0.11);
+  --c-line-2: rgba(255, 255, 255, 0.2);
+
+  --c-ink: #f4f4f2;
+  --c-ink-mid: rgba(244, 244, 242, 0.72);
+  --c-ink-dim: rgba(244, 244, 242, 0.48);
+  --c-ink-faint: rgba(244, 244, 242, 0.3);
+
+  --c-teal: #45cdb9;
+  --c-teal-2: #3fbfad;
+  --c-teal-3: #7fe0d1;
+  --c-teal-soft: rgba(63, 191, 173, 0.16);
+
+  --c-good: #45cdb9;
+  --c-good-soft: rgba(63, 191, 173, 0.16);
+  --c-bad: #ff7a70;
+  --c-bad-soft: rgba(255, 122, 112, 0.14);
+  --c-warn: #e6a944;
+  --c-warn-soft: rgba(230, 169, 68, 0.14);
+  --c-violet: #a78bfa;
+  --c-violet-soft: rgba(167, 139, 250, 0.14);
+
+  --dot: rgba(255, 255, 255, 0.06);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 30px rgba(0, 0, 0, 0.5);
+  --shadow-lift: 0 8px 28px rgba(63, 191, 173, 0.22);
+}
+
+@theme inline {
+  --color-bg: var(--c-bg);
+  --color-surface: var(--c-surface);
+  --color-surface-2: var(--c-surface-2);
+  --color-surface-3: var(--c-surface-3);
+  --color-line: var(--c-line);
+  --color-line-2: var(--c-line-2);
+
+  --color-ink: var(--c-ink);
+  --color-ink-mid: var(--c-ink-mid);
+  --color-ink-dim: var(--c-ink-dim);
+  --color-ink-faint: var(--c-ink-faint);
+
+  --color-teal: var(--c-teal);
+  --color-teal-2: var(--c-teal-2);
+  --color-teal-3: var(--c-teal-3);
+  --color-teal-soft: var(--c-teal-soft);
+
+  /* brand == teal, keep both names available */
+  --color-brand: var(--c-teal);
+  --color-brand-2: var(--c-teal-2);
+  --color-brand-soft: var(--c-teal-soft);
+
+  --color-good: var(--c-good);
+  --color-good-soft: var(--c-good-soft);
+  --color-bad: var(--c-bad);
+  --color-bad-soft: var(--c-bad-soft);
+  --color-warn: var(--c-warn);
+  --color-warn-soft: var(--c-warn-soft);
+  --color-violet: var(--c-violet);
+  --color-violet-soft: var(--c-violet-soft);
+
+  --font-sans: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-display: "Stack Sans Notch", "DM Sans", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+  --ease-brand: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+/* Every interactive control shows the hand cursor on hover. Tailwind v4 no
+   longer defaults buttons to `pointer`, so set it app-wide. In @layer base so
+   explicit `cursor-*` utilities (e.g. cursor-grab, disabled:cursor-not-allowed)
+   still win. */
+@layer base {
+  button,
+  [role="button"],
+  a[href],
+  select,
+  summary,
+  label[for],
+  input[type="checkbox"],
+  input[type="radio"],
+  input[type="submit"],
+  input[type="button"] {
+    cursor: pointer;
+  }
+  button:disabled,
+  button[disabled],
+  select:disabled,
+  [role="button"][aria-disabled="true"] {
+    cursor: not-allowed;
+  }
+}
+
+body {
+  background-color: var(--c-bg);
+  /* Signature dot-grid texture */
+  background-image: radial-gradient(var(--dot) 1px, transparent 1.4px);
+  background-size: 22px 22px;
+  color: var(--c-ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--c-line-2);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+
+/* teal highlight token, matching the film's <em> usage */
+.em {
+  color: var(--c-teal);
+  font-style: normal;
+}
+
+/* ------------------------------------------------------------------ *
+ * Reusable primitives
+ * ------------------------------------------------------------------ */
+@layer components {
+  .display {
+    font-family: var(--font-display);
+    letter-spacing: -0.035em;
+  }
+
+  .card {
+    @apply rounded-2xl border border-line bg-surface;
+    box-shadow: var(--shadow-card);
+  }
+
+  .eyebrow {
+    @apply flex items-center gap-2.5 text-[11px] font-bold uppercase tracking-[0.28em] text-teal;
+  }
+  .eyebrow::before {
+    content: "";
+    width: 26px;
+    height: 1px;
+    background: var(--c-teal);
+    flex-shrink: 0;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl bg-teal px-4 py-2 text-sm font-bold
+      text-white transition-all duration-200 hover:brightness-[1.04] active:translate-y-px
+      disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:brightness-100;
+    box-shadow: 0 6px 18px var(--c-teal-soft);
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl border border-line-2 bg-transparent px-4 py-2
+      text-sm font-bold text-ink-mid transition-all duration-200 hover:border-teal hover:text-teal
+      disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-sm {
+    @apply px-3 py-1.5 text-xs;
+  }
+  .btn-danger {
+    @apply bg-bad text-white;
+    box-shadow: none;
+  }
+
+  .field {
+    @apply w-full rounded-xl border border-line-2 bg-surface px-3 py-2 text-sm text-ink outline-none
+      transition-all duration-150 placeholder:text-ink-faint focus:border-teal
+      focus:ring-4 focus:ring-teal/15;
+  }
+
+  .label {
+    @apply mb-1.5 block text-[11px] font-bold uppercase tracking-[0.14em] text-ink-dim;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-semibold;
+  }
+  .badge-good {
+    @apply border-teal/30 text-teal;
+    background: var(--c-teal-soft);
+  }
+  .badge-muted {
+    @apply border-line-2 text-ink-dim;
+    background: var(--c-surface-3);
+  }
+  .badge-brand {
+    @apply border-teal/30 text-teal;
+    background: var(--c-teal-soft);
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-lg border border-line bg-surface-2 px-2 py-1 font-mono text-[11px] text-ink-mid;
+  }
+
+  /* left-teal-rule accent used everywhere in the brand */
+  .accent-l {
+    border-left: 2px solid var(--c-teal);
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spin {
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.fade-up {
+  animation: fadeUp 0.28s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes recPulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.4;
+    transform: scale(0.85);
+  }
+}
+.rec-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--c-teal);
+  box-shadow: 0 0 8px var(--c-teal);
+  animation: recPulse 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
