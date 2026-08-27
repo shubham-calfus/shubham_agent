@@ -991,6 +991,16 @@ def upload(body: UploadBody):
     }
 
 
+# Screen recording is always on for runs triggered from here.
+#
+# It MUST sit on the payload ROOT, not on each recording: agent.py reads `record_video` as a
+# SUITE-level scalar and then stamps its value onto every recording entry, overwriting whatever
+# was there -- so a per-entry flag is silently replaced by the absent suite value and video stays
+# off. Nothing was setting it at either level, which is why every run produced no video and the
+# report's video player (already built, wired to `video_s3_keys`) rendered empty.
+RECORD_VIDEO_ALWAYS = True
+
+
 def _run_payload(
     name: str,
     py_key: str,
@@ -1009,6 +1019,7 @@ def _run_payload(
             }
         ],
         "execution_mode": execution_mode,
+        "record_video": RECORD_VIDEO_ALWAYS,
     }
     return payload
 
@@ -1297,7 +1308,12 @@ def run(body: RunBody):
         after_action_wait_ms=effective_wait_ms,
         bucket=BUCKET,
     )
-    payload = {"test_suite_id": name, "recordings": entries, "execution_mode": body.execution_mode}
+    payload = {
+        "test_suite_id": name,
+        "recordings": entries,
+        "execution_mode": body.execution_mode,
+        "record_video": RECORD_VIDEO_ALWAYS,
+    }
     cmd, proc = _submit_agent_payload(payload, task_queue=body.task_queue)
     stdout, stderr = proc.stdout, proc.stderr
     agent_result = _extract_agent_result(stdout) or _extract_agent_result(stderr)
@@ -1346,7 +1362,12 @@ def run_suite(body: SuiteRunBody):
     ]
     names = [e["name"] for e in entries]
     suite_id = _safe_name(body.suite_id) or _safe_name("suite_" + "_".join(names[:2]))[:80] or "suite"
-    payload = {"test_suite_id": suite_id, "recordings": entries, "execution_mode": body.execution_mode}
+    payload = {
+        "test_suite_id": suite_id,
+        "recordings": entries,
+        "execution_mode": body.execution_mode,
+        "record_video": RECORD_VIDEO_ALWAYS,
+    }
     cmd, proc = _submit_agent_payload(payload, task_queue=body.task_queue)
     stdout, stderr = proc.stdout, proc.stderr
     agent_result = _extract_agent_result(stdout) or _extract_agent_result(stderr)

@@ -83,8 +83,17 @@ export default function SuitesPage() {
   // bucket, so every member has to exist there before the suite starts. A
   // platform member that is missing gets STAGED (objects written, no
   // recorded_flows row) — the same thing Run does for a single recording.
-  // A member already present is left alone: it may be one you edited locally,
-  // and overwriting it from upstream would silently discard that.
+  // THE SOURCE DROPDOWN DECIDES WHICH BYTES RUN. On a platform source every member is
+  // re-staged from that platform first, so the run executes what is upstream RIGHT NOW; on the
+  // local runner nothing is fetched and the bucket's own copy runs.
+  //
+  // This used to stage only the members that were MISSING locally, to avoid overwriting one you
+  // had edited here. That protected the wrong thing: editing upstream and pressing Run gave you
+  // a silently stale local copy, with nothing in the toast or the report saying which version
+  // executed -- and a suite that runs the wrong script and passes is worse than one that fails.
+  // It also disagreed with the single-recording Run, which always re-stages from the editor
+  // buffer. Want the local copy instead? Switch the source to the local runner; that is what the
+  // dropdown is for.
   const runLocally = async (suite: SuiteRow) => {
     if (!suite.members.length) {
       toast("err", `${suite.name} has no recordings`);
@@ -92,29 +101,33 @@ export default function SuitesPage() {
     }
     setChecking(suite.id);
     try {
-      const local = new Set((await api.scripts()).scripts.map((s) => s.name));
-      const missing = suite.members.filter((name) => !local.has(name));
-      if (missing.length && !onPlatform) {
-        // A local suite naming a recording that is not in the bucket is a broken
-        // suite, not something to fetch — there is no upstream to fetch from.
+      if (!onPlatform) {
+        // A local suite naming a recording that is not in the bucket is a broken suite, not
+        // something to fetch -- there is no upstream to fetch it from.
+        const local = new Set((await api.scripts()).scripts.map((s) => s.name));
+        const missing = suite.members.filter((name) => !local.has(name));
+        if (missing.length) {
+          toast(
+            "err",
+            `${suite.name}: ${missing.length} recording(s) not in the local bucket — ${missing.join(", ")}.`,
+          );
+          return;
+        }
+      } else {
         toast(
-          "err",
-          `${suite.name}: ${missing.length} recording(s) not in the local bucket — ${missing.join(", ")}.`,
+          "ok",
+          `${suite.name}: staging ${suite.members.length} recording(s) from ${sourceLabel(source)}…`,
         );
-        return;
-      }
-      if (missing.length) {
-        toast("ok", `${suite.name}: staging ${missing.length} recording(s) for the local worker…`);
-        for (const name of missing) {
+        for (const name of suite.members) {
           try {
             await stageForLocalRun(name, platformKeys(undefined, name, keyHints));
           } catch (e) {
-            // Fail the whole suite: running it with a member missing would
-            // report a green suite that never executed part of the flow.
+            // Fail the whole suite. Running on a partially-refreshed set would execute a mix of
+            // upstream and stale local scripts -- exactly the ambiguity this rewrite removes.
             throw new Error(`could not stage ${name} — ${errText(e)}`);
           }
         }
-        toast("ok", `${suite.name}: staged ${missing.join(", ")}`);
+        toast("ok", `${suite.name}: running ${sourceLabel(source)} copies of ${suite.members.join(", ")}`);
       }
       await runSuite(suite.members.map((name) => ({ name })));
     } catch (e) {
@@ -131,7 +144,7 @@ export default function SuitesPage() {
         title="Suites"
         subtitle={
           onPlatform
-            ? `Suites from ${sourceLabel(source)} — they run on your local worker.`
+            ? `Suites from ${sourceLabel(source)} — each run downloads that source's current scripts and executes them on your local worker.`
             : "Saved local suites — run them end to end on your local worker."
         }
         actions={
