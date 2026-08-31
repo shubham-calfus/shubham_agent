@@ -18,7 +18,14 @@ export async function PUT(req: Request, { params }: Ctx) {
   const body = await req.json().catch(() => ({}));
   const updated = await updateSuite(id, {
     name: typeof body?.name === "string" ? body.name : undefined,
-    execution_mode: body?.execution_mode,
+    // Same coercion the POST route applies: an unknown string must never reach
+    // the runner's payload as an execution mode.
+    execution_mode:
+      body?.execution_mode === undefined
+        ? undefined
+        : body.execution_mode === "parallel"
+          ? "parallel"
+          : "sequential",
     members: Array.isArray(body?.members) ? body.members.map(String) : undefined,
     graph: body?.graph && typeof body.graph === "object" ? body.graph : undefined,
   });

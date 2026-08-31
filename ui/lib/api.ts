@@ -157,6 +157,11 @@ export const api = {
     list: () => req<{ suites: Suite[] }>("/studio-api/suites"),
     save: (body: SuiteInput) =>
       req<Suite>("/studio-api/suites", { method: "POST", body: JSON.stringify(body) }),
+    update: (id: string, body: Partial<SuiteInput>) =>
+      req<Suite>(`/studio-api/suites/${encodeURIComponent(id)}`, {
+        method: "PUT",
+        body: JSON.stringify(body),
+      }),
     remove: (id: string) =>
       req<{ ok: boolean }>(`/studio-api/suites/${encodeURIComponent(id)}`, { method: "DELETE" }),
   },

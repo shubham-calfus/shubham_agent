@@ -14,7 +14,7 @@ import {
   platformKeys,
   usePlatformStaging,
 } from "@/lib/realapi/staging";
-import type { Suite } from "@/lib/types";
+import type { ExecutionMode, Suite } from "@/lib/types";
 import { PageHeader, EmptyState, Spinner } from "@/components/ui";
 import { IconFlow, IconPlay, IconRefresh } from "@/components/icons";
 
@@ -24,6 +24,7 @@ interface SuiteRow {
   id: string;
   name: string;
   members: string[];
+  mode: ExecutionMode; // the suite's saved mode; the card's toggle overrides it
 }
 
 export default function SuitesPage() {
@@ -32,6 +33,10 @@ export default function SuitesPage() {
   const { toast } = useStore();
   const { stageForLocalRun } = usePlatformStaging();
   const [checking, setChecking] = useState("");
+  // Mode picked on a card this session. Seeded from the suite's saved mode and
+  // written back for LOCAL suites (a platform suite has no local row to save
+  // into, so its choice lasts only until the page reloads).
+  const [modeOverrides, setModeOverrides] = useState<Record<string, ExecutionMode>>({});
 
   // Local file-DB suites (skipped on a platform source).
   const localFetcher = useCallback(
@@ -63,14 +68,29 @@ export default function SuitesPage() {
         id: String(suite.id ?? index),
         name: String(suite.name ?? suite.title ?? "(unnamed)"),
         members: (suite.recorded_flows ?? []).map((flow) => flow.name).filter(Boolean),
+        mode: "sequential" as ExecutionMode, // the platform list carries no mode
       }));
     }
     return (localSuites ?? []).map((suite) => ({
       id: suite.id,
       name: suite.name,
       members: suite.members,
+      mode: suite.execution_mode,
     }));
   }, [onPlatform, platformSuites, localSuites]);
+
+  const modeFor = (suite: SuiteRow): ExecutionMode => modeOverrides[suite.id] ?? suite.mode;
+
+  // Sequential is what makes flow context work: recording 1's extracted values
+  // only reach recording 2 when 2 starts after 1 finished. Parallel starts them
+  // all at once, so pick it only for independent recordings.
+  const setMode = (suite: SuiteRow, mode: ExecutionMode) => {
+    setModeOverrides((prev) => ({ ...prev, [suite.id]: mode }));
+    if (onPlatform) return; // platform suites live upstream; nothing local to persist
+    api.suites.update(suite.id, { execution_mode: mode }).catch((e) => {
+      toast("err", `${suite.name}: could not save mode — ${errText(e)}`);
+    });
+  };
 
   const loading = onPlatform ? platformLoading : localLoading;
   const error = onPlatform ? errText(platformError) : localError;
@@ -129,7 +149,9 @@ export default function SuitesPage() {
         }
         toast("ok", `${suite.name}: running ${sourceLabel(source)} copies of ${suite.members.join(", ")}`);
       }
-      await runSuite(suite.members.map((name) => ({ name })));
+      await runSuite(suite.members.map((name) => ({ name })), {
+        executionMode: modeFor(suite),
+      });
     } catch (e) {
       toast("err", `${suite.name}: ${errText(e)}`);
     } finally {
@@ -189,8 +211,7 @@ export default function SuitesPage() {
                     {suite.name}
                   </h2>
                   <p className="mt-1 text-[12px] text-ink-dim">
-                    {suite.members.length} recording{suite.members.length === 1 ? "" : "s"} ·
-                    sequential
+                    {suite.members.length} recording{suite.members.length === 1 ? "" : "s"}
                   </p>
                 </div>
                 <button
@@ -205,6 +226,19 @@ export default function SuitesPage() {
                   )}
                   Run suite
                 </button>
+              </div>
+
+              <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                <ModeToggle
+                  value={modeFor(suite)}
+                  disabled={checking === suite.id}
+                  onChange={(mode) => setMode(suite, mode)}
+                />
+                <p className="text-[11px] text-ink-dim">
+                  {modeFor(suite) === "sequential"
+                    ? "One after another — extracted values flow to the next recording."
+                    : "All at once — faster, but nothing is passed between recordings."}
+                </p>
               </div>
 
               <ol className="mt-4 space-y-1.5">
@@ -223,6 +257,50 @@ export default function SuitesPage() {
           ))}
         </div>
       </div>
+    </div>
+  );
+}
+
+// --------------------------------------------------------------------------
+// Two-state execution-mode picker. A radiogroup rather than a checkbox/switch
+// because both states are named choices, not on/off.
+// --------------------------------------------------------------------------
+const MODES: ExecutionMode[] = ["sequential", "parallel"];
+
+function ModeToggle({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: ExecutionMode;
+  onChange: (mode: ExecutionMode) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Execution mode"
+      className="inline-flex shrink-0 rounded-xl border border-line-2 bg-surface-2 p-0.5"
+    >
+      {MODES.map((mode) => {
+        const active = value === mode;
+        return (
+          <button
+            key={mode}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            disabled={disabled}
+            onClick={() => onChange(mode)}
+            className={`rounded-[10px] px-2.5 py-1 text-[11px] font-bold uppercase tracking-[0.12em]
+              transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-50 ${
+                active ? "bg-teal text-white" : "text-ink-dim hover:text-ink"
+              }`}
+          >
+            {mode}
+          </button>
+        );
+      })}
     </div>
   );
 }
