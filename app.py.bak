@@ -68,15 +68,6 @@ def _cfg(key: str, default: str = "") -> str:
     return (os.environ.get(key) or _ENV.get(key) or default).strip()
 
 
-def _local_aetherion_home() -> Path:
-    """The fake HOME the local aetherion CLI and worker share.
-
-    Single source of truth: run.sh starts the worker with HOME set to this same directory,
-    so its SDK state (config.json, local_run.json) lands here and both sides read one copy.
-    """
-    return Path(tempfile.gettempdir()) / "agent_shubham_aetherion_home"
-
-
 def _build_local_aetherion_cli_env() -> dict[str, str]:
     """Force the trigger CLI to use the local repo config instead of ~/.config/aetherion."""
     env = dict(os.environ)
@@ -88,7 +79,7 @@ def _build_local_aetherion_cli_env() -> dict[str, str]:
         if text:
             env[name] = text
 
-    cli_home = _local_aetherion_home()
+    cli_home = Path(tempfile.gettempdir()) / "agent_shubham_aetherion_home"
     cfg_dir = cli_home / ".config" / "aetherion"
     cfg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1268,33 +1259,6 @@ def _build_recording_entries(
     return entries
 
 
-def _local_worker_task_queue() -> str:
-    """The task queue the local `aetherion run` worker is actually serving, or "".
-
-    `aetherion run` does NOT serve the default `aetherion-workflows`. It calls the SDK's
-    _configure_local_queue(), which points BOTH the agent and tool queues at one random
-    per-machine UUID queue and persists the id in <HOME>/.config/aetherion/local_run.json.
-    `aetherion agent` never reads that file -- it submits to settings.workflow_task_queue.
-    So the documented local loop (run, then agent) never meets: the workflow is accepted and
-    then sits forever with 0 pollers, and NOTHING reports an error. The run just hangs until
-    the 40-minute timeout.
-
-    We share the worker's HOME (run.sh starts it with HOME=$LOCAL_AETHERION_HOME, the same
-    directory _build_local_aetherion_cli_env builds), so the id is readable right here.
-
-    READ-ONLY on purpose: the SDK's local_task_queue() CREATES the file when missing, which
-    would mint a brand-new queue that no worker is polling -- turning a clear "worker is not
-    running" into the same silent hang. Missing file -> "" -> we pass no --task-queue and keep
-    the old behaviour.
-    """
-    try:
-        raw = (_local_aetherion_home() / ".config" / "aetherion" / "local_run.json").read_text()
-        queue_id = str(json.loads(raw).get("queue_id") or "").strip()
-    except (OSError, ValueError):
-        return ""
-    return f"{queue_id}-task-queue" if queue_id else ""
-
-
 def _submit_agent_payload(
     payload: dict[str, Any],
     *,
@@ -1302,11 +1266,8 @@ def _submit_agent_payload(
 ) -> tuple[list[str], "subprocess.CompletedProcess[str]"]:
     """Shell out to the local aetherion CLI and wait for the run to finish."""
     cmd = [AETHERION_BIN, "agent", "ACT Agent", json.dumps(payload), "--wait"]
-    # An explicit caller-supplied queue always wins; otherwise follow the local worker onto
-    # whatever queue it actually serves (see _local_worker_task_queue).
-    effective_queue = task_queue or _local_worker_task_queue()
-    if effective_queue:
-        cmd += ["--task-queue", effective_queue]
+    if task_queue:
+        cmd += ["--task-queue", task_queue]
     if not Path(AETHERION_BIN).exists():
         raise HTTPException(400, f"aetherion CLI not found at {AETHERION_BIN}")
     env = _build_local_aetherion_cli_env()

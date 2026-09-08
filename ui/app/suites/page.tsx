@@ -16,7 +16,7 @@ import {
 } from "@/lib/realapi/staging";
 import type { ExecutionMode, Suite } from "@/lib/types";
 import { PageHeader, EmptyState, Spinner } from "@/components/ui";
-import { IconFlow, IconPlay, IconRefresh } from "@/components/icons";
+import { IconFlow, IconPin, IconPlay, IconRefresh, IconSearch } from "@/components/icons";
 
 // One shape for both sources: the platform's test-suite-list (suites of
 // recorded_flows) and the local file-DB (suites of recording names).
@@ -25,6 +25,7 @@ interface SuiteRow {
   name: string;
   members: string[];
   mode: ExecutionMode; // the suite's saved mode; the card's toggle overrides it
+  pinned: boolean;
 }
 
 export default function SuitesPage() {
@@ -33,6 +34,8 @@ export default function SuitesPage() {
   const { toast } = useStore();
   const { stageForLocalRun } = usePlatformStaging();
   const [checking, setChecking] = useState("");
+  const [query, setQuery] = useState("");
+  const [pinnedOnly, setPinnedOnly] = useState(false);
   // Mode picked on a card this session. Seeded from the suite's saved mode and
   // written back for LOCAL suites (a platform suite has no local row to save
   // into, so its choice lasts only until the page reloads).
@@ -62,22 +65,70 @@ export default function SuitesPage() {
   // storage keys, so staging reads them straight off it.
   const keyHints = useMemo(() => keyHintsFromSuites(platformSuites), [platformSuites]);
 
-  const rows = useMemo<SuiteRow[]>(() => {
-    if (onPlatform) {
-      return (platformSuites ?? []).map((suite, index) => ({
-        id: String(suite.id ?? index),
-        name: String(suite.name ?? suite.title ?? "(unnamed)"),
-        members: (suite.recorded_flows ?? []).map((flow) => flow.name).filter(Boolean),
-        mode: "sequential" as ExecutionMode, // the platform list carries no mode
-      }));
+  // Pinned suite names (localdb/pins.json). Kept by NAME so one pin covers a
+  // suite whether it is listed from the local file-DB or from a platform
+  // source, whose ids are not stable.
+  const pinsFetcher = useCallback(async () => (await api.pins.list()).pins, []);
+  const { data: pins, setData: setPins } = useAsyncData<string[]>(pinsFetcher);
+  const pinnedNames = useMemo(
+    () => new Set((pins ?? []).map((name) => name.trim().toLowerCase())),
+    [pins],
+  );
+
+  const togglePin = async (suite: SuiteRow) => {
+    const next = !suite.pinned;
+    // Optimistic: the card should move the moment it is clicked. A failed write
+    // is reverted by the reload the toast tells you about.
+    setPins(
+      next
+        ? [...(pins ?? []), suite.name]
+        : (pins ?? []).filter((name) => name.trim().toLowerCase() !== suite.name.trim().toLowerCase()),
+    );
+    try {
+      setPins((await api.pins.set(suite.name, next)).pins);
+    } catch (e) {
+      toast("err", `${suite.name}: could not ${next ? "pin" : "unpin"} — ${errText(e)}`);
     }
-    return (localSuites ?? []).map((suite) => ({
-      id: suite.id,
-      name: suite.name,
-      members: suite.members,
-      mode: suite.execution_mode,
-    }));
-  }, [onPlatform, platformSuites, localSuites]);
+  };
+
+  const rows = useMemo<SuiteRow[]>(() => {
+    const listed: Omit<SuiteRow, "pinned">[] = onPlatform
+      ? (platformSuites ?? []).map((suite, index) => ({
+          id: String(suite.id ?? index),
+          name: String(suite.name ?? suite.title ?? "(unnamed)"),
+          members: (suite.recorded_flows ?? []).map((flow) => flow.name).filter(Boolean),
+          mode: "sequential" as ExecutionMode, // the platform list carries no mode
+        }))
+      : (localSuites ?? []).map((suite) => ({
+          id: suite.id,
+          name: suite.name,
+          members: suite.members,
+          mode: suite.execution_mode,
+        }));
+
+    // Pinned suites first, each half keeping the order the source listed it in
+    // (local suites arrive sorted by name). A stable sort keeps that intact.
+    return listed
+      .map((suite) => ({ ...suite, pinned: pinnedNames.has(suite.name.trim().toLowerCase()) }))
+      .sort((a, b) => Number(b.pinned) - Number(a.pinned));
+  }, [onPlatform, platformSuites, localSuites, pinnedNames]);
+
+  // Search matches the suite name AND its member recordings, so "which suite
+  // runs RH_ORC_REQUISITION" is answerable from the same box. `pinnedOnly`
+  // narrows to the pinned set.
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return rows.filter((suite) => {
+      if (pinnedOnly && !suite.pinned) return false;
+      if (!q) return true;
+      return (
+        suite.name.toLowerCase().includes(q) ||
+        suite.members.some((member) => member.toLowerCase().includes(q))
+      );
+    });
+  }, [rows, query, pinnedOnly]);
+
+  const filtering = query.trim() !== "" || pinnedOnly;
 
   const modeFor = (suite: SuiteRow): ExecutionMode => modeOverrides[suite.id] ?? suite.mode;
 
@@ -151,6 +202,7 @@ export default function SuitesPage() {
       }
       await runSuite(suite.members.map((name) => ({ name })), {
         executionMode: modeFor(suite),
+        suiteName: suite.name,
       });
     } catch (e) {
       toast("err", `${suite.name}: ${errText(e)}`);
@@ -170,10 +222,40 @@ export default function SuitesPage() {
             : "Saved local suites — run them end to end on your local worker."
         }
         actions={
-          <button className="btn-ghost btn-sm" onClick={load} disabled={loading}>
-            {loading ? <Spinner size={14} /> : <IconRefresh width={14} height={14} />}
-            Refresh
-          </button>
+          <>
+            <div className="relative">
+              <IconSearch
+                width={15}
+                height={15}
+                className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink-dim"
+              />
+              <input
+                className="field w-64 pl-9"
+                placeholder="Search suites or recordings…"
+                aria-label="Search suites"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+              />
+            </div>
+            <label
+              className={`btn-ghost btn-sm cursor-pointer select-none ${
+                pinnedOnly ? "text-teal" : ""
+              }`}
+              title="Show only pinned suites"
+            >
+              <input
+                type="checkbox"
+                className="accent-teal"
+                checked={pinnedOnly}
+                onChange={(e) => setPinnedOnly(e.target.checked)}
+              />
+              Pinned only
+            </label>
+            <button className="btn-ghost btn-sm" onClick={load} disabled={loading}>
+              {loading ? <Spinner size={14} /> : <IconRefresh width={14} height={14} />}
+              Refresh
+            </button>
+          </>
         }
       />
 
@@ -202,9 +284,46 @@ export default function SuitesPage() {
           />
         )}
 
+        {/* Filtered everything out — say so instead of showing the "no suites"
+            empty state, which would read as "your suites are gone". */}
+        {!loading && rows.length > 0 && !visible.length && (
+          <EmptyState
+            icon={<IconSearch width={30} height={30} />}
+            title="No matching suites"
+            hint={
+              pinnedOnly && query.trim()
+                ? "No pinned suite matches that search. Clear the filters to see all suites."
+                : pinnedOnly
+                  ? "Nothing is pinned yet — use the pin on a suite card to keep it at the top."
+                  : "No suite name or recording matches that search."
+            }
+            action={
+              <button
+                className="btn btn-sm"
+                onClick={() => {
+                  setQuery("");
+                  setPinnedOnly(false);
+                }}
+              >
+                Clear filters
+              </button>
+            }
+          />
+        )}
+
+        {filtering && visible.length > 0 && (
+          <p className="mb-4 text-[12px] text-ink-dim">
+            {visible.length} of {rows.length} suite{rows.length === 1 ? "" : "s"}
+            {pinnedOnly ? " · pinned only" : ""}
+          </p>
+        )}
+
         <div className="grid gap-4 lg:grid-cols-2">
-          {rows.map((suite) => (
-            <div key={suite.id} className="card p-5">
+          {visible.map((suite) => (
+            <div
+              key={suite.id}
+              className={`card p-5 ${suite.pinned ? "border-teal/40" : ""}`}
+            >
               <div className="flex items-start justify-between gap-4">
                 <div className="min-w-0">
                   <h2 className="truncate text-[15px] font-semibold text-ink" title={suite.name}>
@@ -212,20 +331,31 @@ export default function SuitesPage() {
                   </h2>
                   <p className="mt-1 text-[12px] text-ink-dim">
                     {suite.members.length} recording{suite.members.length === 1 ? "" : "s"}
+                    {suite.pinned ? " · pinned" : ""}
                   </p>
                 </div>
-                <button
-                  className="btn btn-sm shrink-0"
-                  disabled={checking === suite.id}
-                  onClick={() => runLocally(suite)}
-                >
-                  {checking === suite.id ? (
-                    <Spinner size={14} />
-                  ) : (
-                    <IconPlay width={14} height={14} />
-                  )}
-                  Run suite
-                </button>
+                <div className="flex shrink-0 items-center gap-2">
+                  <button
+                    className={`btn-ghost btn-sm !px-2 ${suite.pinned ? "text-teal" : ""}`}
+                    aria-pressed={suite.pinned}
+                    title={suite.pinned ? "Unpin from the top" : "Pin to the top"}
+                    onClick={() => togglePin(suite)}
+                  >
+                    <IconPin width={16} height={16} filled={suite.pinned} />
+                  </button>
+                  <button
+                    className="btn btn-sm"
+                    disabled={checking === suite.id}
+                    onClick={() => runLocally(suite)}
+                  >
+                    {checking === suite.id ? (
+                      <Spinner size={14} />
+                    ) : (
+                      <IconPlay width={14} height={14} />
+                    )}
+                    Run suite
+                  </button>
+                </div>
               </div>
 
               <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1.5">

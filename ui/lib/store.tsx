@@ -4,18 +4,29 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
   type ReactNode,
 } from "react";
-import type { RunResult } from "./types";
+import { api, pollRun } from "./api";
+import type { RunRecord, RunResult } from "./types";
 
 // --------------------------------------------------------------------------
-// In-memory app state shared across pages: the suite being assembled, the run
-// output tabs, and toast notifications. Kept client-side only (no persistence)
-// so a page refresh starts clean — matching shubham_agent's session model.
+// App state shared across pages: the suite being assembled, the run output
+// tabs, and toast notifications.
+//
+// The suite cart and the toasts are session state (client-side only). The RUN
+// TABS are not: they are a view of the file-DB records under localdb/runs/, so
+// they are restored on mount and a run that is still executing is picked back
+// up. Before that, closing or reloading the tab abandoned live runs and hid
+// finished reports that were sitting on disk the whole time.
 // --------------------------------------------------------------------------
+
+// How many past runs come back as tabs. The strip has to stay readable, and
+// older records remain on disk (and in /downloads) either way.
+const RUN_TABS_LIMIT = 12;
 
 export interface Toast {
   id: number;
@@ -23,14 +34,20 @@ export interface Toast {
   text: string;
 }
 
-export interface RunTab {
-  id: string;
-  label: string;
-  kind: "single" | "suite";
-  startedAt: number;
-  status: "running" | "done" | "error";
-  result?: RunResult;
-  error?: string;
+// A tab IS a run record — same id, same fields — so nothing has to be mapped
+// between the two representations.
+export type RunTab = RunRecord;
+
+// The id is minted here and sent to the server, so the tab and the record are
+// one thing. crypto.randomUUID needs a secure context (localhost counts); the
+// fallback keeps the shape valid on a plain-http origin, because the server
+// refuses an id that is not a uuid.
+function newRunId(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (ch) => {
+    const rand = (Math.random() * 16) | 0;
+    return (ch === "x" ? rand : (rand & 0x3) | 0x8).toString(16);
+  });
 }
 
 interface Store {
@@ -62,6 +79,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [activeRunId, setActiveRunId] = useState("");
   const [toasts, setToasts] = useState<Toast[]>([]);
   const seq = useRef(0);
+  // Every run id this session already has a tab for (live or restored). Guards
+  // the restore pass from re-adding a run that is on screen and from starting a
+  // second poller for it.
+  const tracked = useRef<Set<string>>(new Set());
 
   const inSuite = useCallback((name: string) => suite.includes(name), [suite]);
 
@@ -96,7 +117,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const startRun = useCallback((label: string, kind: "single" | "suite") => {
-    const id = `run-${++seq.current}`;
+    const id = newRunId();
+    tracked.current.add(id);
     setRunTabs((t) => [
       ...t,
       { id, label, kind, startedAt: Date.now(), status: "running" as const },
@@ -115,13 +137,50 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setRunTabs((t) => t.map((r) => (r.id === id ? { ...r, status: "error", error } : r)));
   }, []);
 
+  // Closing a tab forgets the run for good: without deleting the record it
+  // would just come back on the next reload. The HTML report stays in the
+  // backend's downloads/ folder.
   const closeRun = useCallback((id: string) => {
+    tracked.current.delete(id);
     setRunTabs((t) => {
       const next = t.filter((r) => r.id !== id);
       setActiveRunId((cur) => (cur === id ? (next[next.length - 1]?.id ?? "") : cur));
       return next;
     });
+    void api.runs.remove(id).catch(() => {});
   }, []);
+
+  // Follow a run that is executing server-side until it settles. Used for runs
+  // restored on mount; a run triggered in this session is already awaited by
+  // the caller in lib/runner.ts.
+  const watchRun = useCallback(
+    (rec: RunRecord) => {
+      pollRun(rec.id, rec.startedAt)
+        .then((result) => finishRun(rec.id, result))
+        .catch((e) => failRun(rec.id, e instanceof Error ? e.message : String(e)));
+    },
+    [finishRun, failRun],
+  );
+
+  // Restore the run history once per mount. A failure here is not fatal — the
+  // app still works, it just starts with an empty tab strip — so it only warns.
+  useEffect(() => {
+    let alive = true;
+    api.runs
+      .list(RUN_TABS_LIMIT)
+      .then(({ runs }) => {
+        if (!alive) return;
+        const restored = runs.filter((rec) => !tracked.current.has(rec.id));
+        if (!restored.length) return;
+        restored.forEach((rec) => tracked.current.add(rec.id));
+        setRunTabs((current) => [...restored, ...current]);
+        restored.filter((rec) => rec.status === "running").forEach(watchRun);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [watchRun]);
 
   const value = useMemo<Store>(
     () => ({

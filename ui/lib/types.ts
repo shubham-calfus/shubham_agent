@@ -85,7 +85,26 @@ export interface RunResult {
   prepared_recording_names?: string[];
   // suite extras
   suite_id?: string;
+  suite_name?: string;
   recordings?: string[];
+}
+
+export type RunStatus = "running" | "done" | "error";
+
+// One persisted run (localdb/runs/<id>.json). Lives here, not in runsStore, so
+// the browser can type the history it fetches without importing a module that
+// pulls in node:fs.
+export interface RunRecord {
+  id: string;
+  kind: "single" | "suite";
+  label: string;
+  // "done"  = the backend returned a RunResult (which may itself be pass OR fail)
+  // "error" = the trigger/backend call itself failed (network / 5xx)
+  status: RunStatus;
+  startedAt: number;
+  finishedAt?: number;
+  result?: RunResult;
+  error?: string;
 }
 
 export interface AppConfig {

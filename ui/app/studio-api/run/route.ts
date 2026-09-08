@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { randomUUID } from "crypto";
 import http from "node:http";
 import https from "node:https";
-import { writeRun, type RunRecord } from "@/lib/runsStore";
+import { isRunId, listRuns, writeRun, type RunRecord } from "@/lib/runsStore";
 import type { RunResult } from "@/lib/types";
 
 // Local file-DB endpoint under /studio-api (NOT proxied to the backend).
@@ -43,13 +43,32 @@ function postJsonNoTimeout(urlStr: string, bodyObj: unknown): Promise<{ status: 
 // Hold in-flight tasks so the runtime doesn't drop them after the response returns.
 const inflight = new Set<Promise<unknown>>();
 
+// The run history the Runs page rehydrates from after a reload.
+export async function GET(req: Request) {
+  const raw = Number(new URL(req.url).searchParams.get("limit"));
+  const limit = Number.isFinite(raw) && raw > 0 ? Math.min(raw, 200) : undefined;
+  return NextResponse.json({ runs: await listRuns(limit) });
+}
+
 export async function POST(req: Request) {
   const body = await req.json().catch(() => null);
   const kind: RunRecord["kind"] = body?.kind === "suite" ? "suite" : "single";
   const payload = body?.payload ?? {};
 
-  const id = randomUUID();
-  const base: RunRecord = { id, kind, status: "running", startedAt: Date.now() };
+  // The browser mints the id so its run TAB and this record are the same thing:
+  // that shared id is what lets a reloaded page find a run it already started
+  // (and keep polling one that is still executing). A caller that sends nothing
+  // usable still gets a server id -- but only a real uuid is accepted, since the
+  // id becomes a filename.
+  const id = isRunId(body?.id) ? body.id : randomUUID();
+  const label = typeof body?.label === "string" ? body.label.trim() : "";
+  const base: RunRecord = {
+    id,
+    kind,
+    label: label || (kind === "suite" ? "Suite" : "Run"),
+    status: "running",
+    startedAt: Date.now(),
+  };
   await writeRun(base);
 
   const endpoint = kind === "suite" ? "/api/run-suite" : "/api/run";

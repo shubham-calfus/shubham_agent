@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
 # One command to (re)start the whole local ACT Agent stack with FRESH code:
-#   1. ACT worker         aetherion run            (act/.venv, cwd act — agents AND tools)
-#   2. API backend        this app.py              (:8765 — MinIO, Postgres, aetherion CLI)
-#   3. ACT Studio UI      ui/ (Next.js)            (:3111 — proxies /api → :8765)
+#   1. ACT Agent worker   aetherion run --agent   (act/.venv, cwd act)
+#   2. tool worker        aetherion run --tool
+#   3. API backend        this app.py              (:8765 — MinIO, Postgres, aetherion CLI)
+#   4. ACT Studio UI      ui/ (Next.js)            (:3111 — proxies /api → :8765)
 #
 # ACT Studio is the ONLY UI: app.py's old built-in HTML page was removed, and
 # GET :8765/ now redirects to the Studio.
@@ -53,15 +54,7 @@ fi
 echo "==> Runner: $ACT_AGENT_DIR"
 echo "==> Stopping any running ACT Agent workers / app.py ..."
 # Long-running workers that hold stale code (NOT the short-lived 'aetherion agent' triggers).
-# Match the INTERPRETER, not the console script: the worker's argv is
-#   <act>/.venv/bin/python3 .venv/bin/aetherion run
-# so the aetherion path in it is RELATIVE. The old pattern
-# ("$ACT_AGENT_DIR/.venv/bin/aetherion run") never matched a single process, so every
-# ./run.sh silently stacked another worker on top of the last one. Three of them polling
-# one queue is not merely untidy -- workers from before and after a `uv sync` hold
-# DIFFERENT code, and whichever picks the task decides which version runs.
-# Still scoped to act's venv, so a sibling repo's worker (act_analyst) is left alone.
-pkill -f "$ACT_AGENT_DIR/.venv/bin/python.*aetherion run" 2>/dev/null || true
+pkill -f "$ACT_AGENT_DIR/.venv/bin/aetherion run" 2>/dev/null || true
 pkill -f "shubham_agent/app.py" 2>/dev/null || true
 # Free the backend port in case something else is still holding it.
 PORT_PIDS="$(lsof -ti "tcp:$PORT" 2>/dev/null || true)"
@@ -85,33 +78,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ---- worker ----------------------------------------------------------------
-# ONE process serves both agents and tools: `aetherion run` takes no options now.
-# It used to be two (`run --agent` + `run --tool`), and those flags are gone -- on a
-# current sdk each died instantly with "Error: No such option '--agent'". Nothing here
-# checked, so run.sh happily went on to start the backend + UI and you got a stack that
-# LOOKS healthy with no workers behind it: every trigger connects, then hangs forever
-# because nothing is polling the task queue. Hence the liveness check below -- a dead
-# worker must be loud, not silent.
-echo "==> Starting ACT worker (agents + tools)  (logs: $LOG_DIR/worker.log)"
-( cd "$ACT_AGENT_DIR" && exec env HOME="$LOCAL_AETHERION_HOME" "$AETHERION" run ) >"$LOG_DIR/worker.log" 2>&1 &
-WORKER_PID="$!"
-PIDS+=("$WORKER_PID")
+# ---- workers ---------------------------------------------------------------
+echo "==> Starting ACT Agent worker  (logs: $LOG_DIR/agent.log)"
+( cd "$ACT_AGENT_DIR" && exec env HOME="$LOCAL_AETHERION_HOME" "$AETHERION" run --agent ) >"$LOG_DIR/agent.log" 2>&1 &
+PIDS+=("$!")
 
-# Give it a moment to either register or die, then confirm it is actually alive.
-for _ in $(seq 1 30); do
-  kill -0 "$WORKER_PID" 2>/dev/null || break
-  grep -q "Agents and tools are running" "$LOG_DIR/worker.log" 2>/dev/null && break
-  sleep 1
-done
-if ! kill -0 "$WORKER_PID" 2>/dev/null; then
-  echo "ERROR: the ACT worker exited immediately. Last lines of $LOG_DIR/worker.log:" >&2
-  tail -20 "$LOG_DIR/worker.log" >&2
-  exit 1
-fi
-grep -q "Available agents" "$LOG_DIR/worker.log" 2>/dev/null \
-  && echo "    worker ready: $(grep -m1 'Available agents' "$LOG_DIR/worker.log" | sed 's/.*Available agents: //')" \
-  || echo "    WARNING: worker is up but has not logged 'Available agents' yet -- check $LOG_DIR/worker.log"
+echo "==> Starting tool worker       (logs: $LOG_DIR/tool.log)"
+( cd "$ACT_AGENT_DIR" && exec env HOME="$LOCAL_AETHERION_HOME" "$AETHERION" run --tool ) >"$LOG_DIR/tool.log" 2>&1 &
+PIDS+=("$!")
 
 # ---- no-UI mode: app.py in the foreground (the pre-Studio behavior) --------
 if [ "$WANT_UI" = "0" ]; then

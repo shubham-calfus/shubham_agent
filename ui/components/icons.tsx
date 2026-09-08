@@ -141,6 +141,18 @@ export const IconLayers = (p: P) => (
     <path d="M3 12l9 5 9-5M3 16l9 5 9-5" />
   </svg>
 );
+// A push-pin, head up / needle down. `filled` solidifies the head so a pinned
+// suite reads as ON at a glance instead of relying on colour alone (the needle
+// is an open path, so filling it adds nothing).
+export const IconPin = ({ filled, ...p }: P & { filled?: boolean }) => (
+  <svg {...base(p)}>
+    <path
+      d="M8.5 3.5h7M12 3.5v6.2M7.2 15.2c0-2.6 2.1-4.7 4.8-5.5 2.7.8 4.8 2.9 4.8 5.5H7.2Z"
+      fill={filled ? "currentColor" : "none"}
+    />
+    <path d="M12 15.2V21" />
+  </svg>
+);
 export const IconGrip = (p: P) => (
   <svg {...base(p)}>
     <circle cx="9" cy="6" r="1" />
