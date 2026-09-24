@@ -7,6 +7,7 @@ import type { AppConfig } from "@/lib/types";
 import { PageHeader, Spinner } from "@/components/ui";
 import { FadeUp } from "@/components/motion";
 import { ConnectionCard } from "@/components/ConnectionCard";
+import { RunDefaultsCard } from "@/components/RunDefaultsCard";
 import { IconDatabase, IconLink, IconRefresh, IconSettings } from "@/components/icons";
 
 export default function ConfigPage() {
@@ -60,6 +61,8 @@ export default function ConfigPage() {
 
       <div className="space-y-6 p-8">
         <ConnectionCard />
+
+        <RunDefaultsCard defaultUrl={config?.default_url ?? ""} />
 
         {error && (
           <div className="rounded-xl border border-bad/25 bg-bad-soft px-4 py-3 text-sm text-bad">

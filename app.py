@@ -105,6 +105,21 @@ def _build_local_aetherion_cli_env() -> dict[str, str]:
 
 
 DEFAULT_AFTER_ACTION_WAIT_MS = int(_cfg("DEFAULT_AFTER_ACTION_WAIT_MS", "0") or "0")
+
+# The Oracle instance every local run points at unless a caller says otherwise.
+#
+# It has a default at all because the suite URL is no longer optional: since act 6.0.88 it is the
+# ONLY source of a recording's start URL -- the one stored in the params workbook is ignored --
+# so a run that omits it fails before the browser opens. Local development targets one demo pod,
+# so making that the default is what keeps a plain `/api/run` working the way it did before.
+#
+# Overridable with ACT_DEFAULT_URL, and beaten by any url the caller actually sends, so pointing
+# at a different environment never means editing this file.
+DEFAULT_APP_URL = _cfg(
+    "ACT_DEFAULT_URL",
+    "https://fa-eqje-dev7-saasfademo1.ds-fa.oraclepdemos.com",
+)
+
 DEFAULT_MULTI_LINE_SHEET_NAME = "line_items"
 # Fixed column that joins a line-item row to its header row (present in BOTH sheets). Hardcoded,
 # not configurable -- every multi-header repeatable recording links its lines to headers by ref_id
@@ -1010,6 +1025,46 @@ def upload(body: UploadBody):
 RECORD_VIDEO_ALWAYS = True
 
 
+# Suite-level scalars the runner reads straight off the payload ROOT, named exactly as the
+# recordings reference them ({{url}} / {{username}} / {{password}}). They are the local
+# equivalent of the three fields on the platform's agent form, and they sit at the root for the
+# same reason `record_video` does: agent.py reads them as SUITE-level values and stamps them
+# onto every recording, so a per-entry copy is silently overwritten by the absent suite value.
+#
+# The URL is what forced this. Since act 6.0.88 the suite URL is the ONLY source of a
+# recording's start URL -- the one stored in the params workbook is ignored outright -- so a
+# recording whose first `goto` is a `{{placeholder}}` fails before the browser even opens when
+# nothing supplies one. Runs triggered from here had no way to pass it at all.
+#
+# Deliberately NOT validated here: whether a recording NEEDS a URL depends on whether its first
+# goto is a placeholder or a hardcoded literal, which this tool cannot know without parsing the
+# script. A blanket "url is required" check would wrongly block the recordings that hardcode it,
+# so the rule stays in the runner -- the only place that can apply it per recording -- and its
+# error already names the field to fill.
+_SUITE_LEVEL_KEYS = ("url", "username", "password")
+
+
+def _suite_level_values(body: Any) -> dict[str, str]:
+    """The non-blank suite scalars from a run request, ready to merge into the payload root.
+
+    A blank one is DROPPED rather than sent as "": presence is provision on the runner side, so
+    an empty string reads as "the suite supplied a username" and would blank out a recording's
+    own workbook value instead of leaving it alone.
+    """
+    values = {
+        key: value
+        for key in _SUITE_LEVEL_KEYS
+        if (value := str(getattr(body, key, "") or "").strip())
+    }
+    # The URL falls back to the configured instance, so a caller that sends no url at all (a
+    # plain curl, an older UI build) still runs instead of failing at the first navigation.
+    # Only the URL gets this: a default USERNAME would silently log a recording in as the wrong
+    # user, which is worse than the error it would have saved.
+    if not values.get("url") and DEFAULT_APP_URL:
+        values["url"] = DEFAULT_APP_URL
+    return values
+
+
 def _run_payload(
     name: str,
     py_key: str,
@@ -1056,6 +1111,11 @@ class RunBody(BaseModel):
     after_action_wait_ms: int | None = DEFAULT_AFTER_ACTION_WAIT_MS
     task_queue: str = ""
     download_report: bool = True
+    # See _SUITE_LEVEL_KEYS. `url` is effectively required for any recording that navigates
+    # via a placeholder; the other two are defaults for recordings whose row supplies none.
+    url: str = ""
+    username: str = ""
+    password: str = ""
 
 
 class SuiteRecording(BaseModel):
@@ -1078,6 +1138,10 @@ class SuiteRunBody(BaseModel):
     after_action_wait_ms: int | None = DEFAULT_AFTER_ACTION_WAIT_MS
     task_queue: str = ""
     download_report: bool = True
+    # See _SUITE_LEVEL_KEYS. One suite runs against one environment, so these are suite-wide.
+    url: str = ""
+    username: str = ""
+    password: str = ""
 
 
 def _extract_agent_result(stdout: str) -> Any:
@@ -1364,6 +1428,8 @@ def run(body: RunBody):
         "execution_mode": body.execution_mode,
         "record_video": RECORD_VIDEO_ALWAYS,
     }
+    suite_values = _suite_level_values(body)
+    payload.update(suite_values)
     cmd, proc = _submit_agent_payload(payload, task_queue=body.task_queue)
     stdout, stderr = proc.stdout, proc.stderr
     agent_result = _extract_agent_result(stdout) or _extract_agent_result(stderr)
@@ -1388,6 +1454,8 @@ def run(body: RunBody):
         "report_url": report_url,
         "used_after_action_wait_ms": effective_wait_ms,
         "execution_mode": body.execution_mode,
+        # NAMES only, never values -- one of these is a password.
+        "suite_level_keys": sorted(suite_values),
         "inline_parameter_keys": sorted(str(key) for key in inline_parameters),
         "inline_multi_line_row_count": len(inline_multi_line_rows),
         "prepared_recording_count": len(entries),
@@ -1429,6 +1497,8 @@ def run_suite(body: SuiteRunBody):
     }
     if suite_name:
         payload["test_suite_name"] = suite_name
+    suite_values = _suite_level_values(body)
+    payload.update(suite_values)
     cmd, proc = _submit_agent_payload(payload, task_queue=body.task_queue)
     stdout, stderr = proc.stdout, proc.stderr
     agent_result = _extract_agent_result(stdout) or _extract_agent_result(stderr)
@@ -1447,6 +1517,8 @@ def run_suite(body: SuiteRunBody):
         "report_url": report_url,
         "used_after_action_wait_ms": effective_wait_ms,
         "execution_mode": body.execution_mode,
+        # NAMES only, never values -- one of these is a password.
+        "suite_level_keys": sorted(suite_values),
         "suite_id": suite_id,
         "suite_name": suite_name,
         "recordings": names,
@@ -1457,7 +1529,10 @@ def run_suite(body: SuiteRunBody):
 def get_config():
     return {"bucket": BUCKET, "storage_endpoint": STORAGE_ENDPOINT, "aetherion_bin": AETHERION_BIN,
             "test_runner_dir": str(TEST_RUNNER_DIR), "pg": {"host": PG["host"], "port": PG["port"], "db": PG["dbname"]},
-            "default_after_action_wait_ms": DEFAULT_AFTER_ACTION_WAIT_MS}
+            "default_after_action_wait_ms": DEFAULT_AFTER_ACTION_WAIT_MS,
+            # So the Settings form can show the URL a blank field will actually use, rather
+            # than hardcoding a second copy of it in the front end.
+            "default_url": DEFAULT_APP_URL}
 
 
 # --------------------------------------------------------------------------- root

@@ -95,6 +95,23 @@ async function runViaQueue(
   return pollRun(runId);
 }
 
+/**
+ * Suite-level values the runner reads off the payload ROOT, named exactly as recordings
+ * reference them ({{url}} / {{username}} / {{password}}).
+ *
+ * `url` is the start URL for EVERY recording in the run. Since act 6.0.88 it is the only
+ * source of one -- the URL stored in a recording's params workbook is ignored outright -- so a
+ * recording whose first navigation is a placeholder cannot run without it.
+ *
+ * `username` / `password` are DEFAULTS: a recording whose own params row supplies a credential
+ * keeps using it, so one run can still drive recordings that log in as different users.
+ */
+type SuiteLevelValues = {
+  url?: string;
+  username?: string;
+  password?: string;
+};
+
 export const api = {
   config: () => req<AppConfig>("/api/config"),
 
@@ -141,7 +158,7 @@ export const api = {
     execution_mode?: ExecutionMode;
     after_action_wait_ms?: number | null;
     record_video?: boolean;
-  }) =>
+  } & SuiteLevelValues) =>
     req<RunResult>("/api/run", {
       method: "POST",
       body: JSON.stringify(payload),
@@ -154,7 +171,7 @@ export const api = {
     execution_mode?: ExecutionMode;
     after_action_wait_ms?: number | null;
     record_video?: boolean;
-  }) =>
+  } & SuiteLevelValues) =>
     req<RunResult>("/api/run-suite", {
       method: "POST",
       body: JSON.stringify(payload),
@@ -169,7 +186,7 @@ export const api = {
       execution_mode?: ExecutionMode;
       after_action_wait_ms?: number | null;
       record_video?: boolean;
-    },
+    } & SuiteLevelValues,
     meta: RunMeta,
   ) => runViaQueue("single", payload, meta),
 
@@ -181,7 +198,7 @@ export const api = {
       execution_mode?: ExecutionMode;
       after_action_wait_ms?: number | null;
       record_video?: boolean;
-    },
+    } & SuiteLevelValues,
     meta: RunMeta,
   ) => runViaQueue("suite", payload, meta),
 

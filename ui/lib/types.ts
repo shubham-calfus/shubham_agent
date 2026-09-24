@@ -114,6 +114,9 @@ export interface AppConfig {
   test_runner_dir: string;
   pg: { host: string; port: number; db: string };
   default_after_action_wait_ms: number;
+  // The application URL a run uses when the Settings field is left blank. Owned by the
+  // backend so there is one copy of it, not one here and one there.
+  default_url: string;
 }
 
 export type ExecutionMode = "parallel" | "sequential";
