@@ -2,7 +2,7 @@ import { promises as fs } from "fs";
 import path from "path";
 
 // --------------------------------------------------------------------------
-// Pinned suites — the `pins` table of act_ui's file-DB (a single JSON array
+// Pinned suites — the `pins` table of act_studio's file-DB (a single JSON array
 // under localdb/, same shape as suites.json). Server-side only; used by the
 // /studio-api/pins route handlers. Override the location with ACT_LOCALDB_DIR.
 //

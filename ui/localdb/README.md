@@ -1,6 +1,6 @@
-# localdb — act_ui's file-based "DB"
+# localdb — act_studio's file-based "DB"
 
-No real database yet, so act_ui persists data as JSON files here. Each file is a
+No real database yet, so act_studio persists data as JSON files here. Each file is a
 "table". Served by the Next.js route handlers under `app/studio-api/` (kept off
 the `/api/*` prefix so the FastAPI proxy never intercepts them).
 

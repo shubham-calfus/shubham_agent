@@ -2,7 +2,7 @@
 
 A Next.js front-end for the local **ACT Agent** stack — the interactive,
 Aetherion/Calfus-branded alternative to the `app.py` single-file HTML UI. Moved
-here from the standalone `act_ui` repo so the UI is tracked alongside the backend
+here from the standalone `act_studio` repo so the UI is tracked alongside the backend
 it talks to.
 
 It is a **pure frontend**. Every `/api/*` and `/downloads/*` request is proxied

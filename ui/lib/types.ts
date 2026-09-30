@@ -121,7 +121,7 @@ export interface AppConfig {
 
 export type ExecutionMode = "parallel" | "sequential";
 
-// ---- Local file-DB entities (act_ui/localdb) ------------------------------
+// ---- Local file-DB entities (act_studio/localdb) ------------------------------
 export interface SuiteGraph {
   nodes: unknown[];
   edges: unknown[];

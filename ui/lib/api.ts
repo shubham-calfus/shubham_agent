@@ -41,9 +41,9 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
-// ---- Async run queue (act_ui-native, /studio-api — NOT proxied) -----------
+// ---- Async run queue (act_studio-native, /studio-api — NOT proxied) -----------
 // Trigger a run, then poll for completion, so the browser never holds one long
-// blocking request open. The blocking wait now lives server-side (act_ui Node
+// blocking request open. The blocking wait now lives server-side (act_studio Node
 // -> backend), which has no browser/proxy timeout, so a long run no longer shows
 // a false "Internal Server Error" while it's actually still running.
 //
@@ -224,7 +224,7 @@ export const api = {
       }),
   },
 
-  // Saved suites — backed by act_ui's local file-DB (/studio-api, not proxied).
+  // Saved suites — backed by act_studio's local file-DB (/studio-api, not proxied).
   suites: {
     list: () => req<{ suites: Suite[] }>("/studio-api/suites"),
     save: (body: SuiteInput) =>

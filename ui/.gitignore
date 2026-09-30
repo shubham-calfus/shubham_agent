@@ -40,7 +40,7 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# local file-DB data (act_ui) — transient runtime state (suites + async run records).
+# local file-DB data (act_studio) — transient runtime state (suites + async run records).
 /localdb/*.json
 /localdb/runs/
 !.env.example

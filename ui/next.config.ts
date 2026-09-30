@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 // --------------------------------------------------------------------------
-// act_ui is a pure frontend. Every /api and /downloads request is proxied to
+// act_studio is a pure frontend. Every /api and /downloads request is proxied to
 // the shubham_agent FastAPI backend (the process that actually talks to MinIO,
 // Postgres and the local `aetherion` CLI). Point ACT_BACKEND_URL elsewhere to
 // target a different backend host.

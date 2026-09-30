@@ -4,7 +4,7 @@ import { randomUUID } from "crypto";
 import type { Suite, SuiteInput } from "./types";
 
 // --------------------------------------------------------------------------
-// File-based "DB" for act_ui — no real database yet. The `suites` table is a
+// File-based "DB" for act_studio — no real database yet. The `suites` table is a
 // single JSON file (an array of suites) under localdb/. Server-side only; used
 // by the /studio-api/suites route handlers. Override the location with
 // ACT_LOCALDB_DIR.
