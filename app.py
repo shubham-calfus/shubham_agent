@@ -774,6 +774,23 @@ def _load_saved_runtime_payload(name: str, bucket: str) -> tuple[list[dict[str, 
     return params_rows, multi_line_rows, params_key
 
 
+def _saved_workbook_columns(params_key: str, bucket: str) -> list[str]:
+    """The saved workbook's declared columns, blank ones included, as act's parse_workbook reports them."""
+    if not params_key:
+        return []
+    raw = _s3().get_object(Bucket=bucket, Key=params_key)["Body"].read()
+    if params_key.endswith(".csv"):
+        header_rows = [next(csv.reader(io.StringIO(raw.decode("utf-8", "replace"))), [])]
+    else:
+        import openpyxl
+
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        header_rows = [next(sheet.iter_rows(max_row=1, values_only=True), ()) for sheet in wb.worksheets]
+        wb.close()
+    names = [_safe_name(str(cell).strip()) for row in header_rows for cell in row if cell is not None and str(cell).strip()]
+    return list(dict.fromkeys(name for name in names if name))
+
+
 def _load_recording_config(name: str, bucket: str) -> dict[str, Any]:
     s3 = _s3()
     safe = _safe_name(name)
@@ -1153,15 +1170,27 @@ def _extract_agent_result(stdout: str) -> Any:
     return None
 
 
-def _find_report_key(result: Any) -> str:
+def _result_items(result: Any) -> list:
     items = result if isinstance(result, list) else (result.get("result") or result.get("outputs") or [] if isinstance(result, dict) else [])
     if isinstance(result, dict) and not items:
         items = [result]
-    for item in items if isinstance(items, list) else []:
+    return items if isinstance(items, list) else []
+
+
+def _find_report_key(result: Any) -> str:
+    for item in _result_items(result):
         if isinstance(item, dict) and str(item.get("type") or "") == "s3_download_link":
             if item.get("file_key"):
                 return str(item["file_key"])
     return ""
+
+
+def _suite_passed(result: Any) -> bool:
+    # The CLI exits 0 even when recordings fail; only the agent's "summary" output says whether they passed.
+    for item in _result_items(result):
+        if isinstance(item, dict) and str(item.get("type") or "") == "summary":
+            return int(item.get("total") or 0) > 0 and int(item.get("failed") or 0) == 0
+    return False
 
 
 def _report_url_for_dest(dest: Path) -> str:
@@ -1195,12 +1224,15 @@ def _build_recording_entry(
             rec[DEFAULT_MULTI_LINE_SHEET_NAME] = inline_multi_line_rows
         rec["skip_parameters_file_load"] = True
     else:
-        params_rows, multi_line_rows, _params_key = _load_saved_runtime_payload(safe, bucket)
+        params_rows, multi_line_rows, params_key = _load_saved_runtime_payload(safe, bucket)
         if params_rows or multi_line_rows:
             rec["parameters"] = dict(params_rows[0]) if params_rows else {}
             if multi_line_rows:
                 rec[DEFAULT_MULTI_LINE_SHEET_NAME] = list(multi_line_rows)
             rec["skip_parameters_file_load"] = True
+            columns = _saved_workbook_columns(params_key, bucket)
+            if columns:
+                rec["parameter_columns"] = columns
     rec["after_action_wait_ms"] = after_action_wait_ms
     return rec
 
@@ -1226,6 +1258,7 @@ def _build_recording_entries(
         params_key = ""
     else:
         params_rows, multi_line_rows, params_key = _load_saved_runtime_payload(safe, bucket)
+    parameter_columns = _saved_workbook_columns(params_key, bucket)
 
     if not params_rows:
         params_rows = [{}]
@@ -1327,6 +1360,8 @@ def _build_recording_entries(
             rec["skip_parameters_file_load"] = True
         if params_key:
             rec["parameters_file_key"] = params_key
+        if parameter_columns:
+            rec["parameter_columns"] = list(parameter_columns)
         entries.append(rec)
 
     return entries
@@ -1388,19 +1423,12 @@ def _submit_agent_payload(
     return cmd, proc
 
 
-def _download_run_report(report_key: str, label: str) -> tuple[str, str]:
-    """Download the run's HTML report to a unique local file; return (path, url).
-
-    The S3 key is always <suite>/<run_id>/report.html, so naming the local file by
-    basename alone makes every run collide on downloads/report.html at the same URL
-    — the browser then serves a cached previous run. Key it by run_id so each run
-    gets a unique URL and "Open report" always shows the run just executed.
-    """
+def _download_run_report(report_key: str) -> tuple[str, str]:
+    # Keys are <shared folder>/TestSuite_<name>_<run id>.html, so only the file name is unique per run.
     try:
         DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
         raw = _s3().get_object(Bucket=BUCKET, Key=report_key)["Body"].read()
-        run_uuid = Path(report_key).parent.name or "run"
-        dest = DOWNLOADS_DIR / f"{_safe_name(label)}_{run_uuid}.html"
+        dest = DOWNLOADS_DIR / f"{_safe_name(Path(report_key).stem)}.html"
         dest.write_bytes(raw)
         return str(dest), _report_url_for_dest(dest)
     except Exception as exc:
@@ -1436,7 +1464,7 @@ def run(body: RunBody):
     report_key = _find_report_key(agent_result)
     report_local, report_url = "", ""
     if report_key and body.download_report:
-        report_local, report_url = _download_run_report(report_key, name)
+        report_local, report_url = _download_run_report(report_key)
     inline_parameters = entries[0].get("parameters") if entries and isinstance(entries[0].get("parameters"), dict) else {}
     inline_multi_line_rows = (
         entries[0].get(DEFAULT_MULTI_LINE_SHEET_NAME)
@@ -1444,7 +1472,7 @@ def run(body: RunBody):
         else []
     )
     return {
-        "ok": proc.returncode == 0,
+        "ok": proc.returncode == 0 and _suite_passed(agent_result),
         "returncode": proc.returncode,
         "cmd": " ".join(cmd[:3]) + " '<payload>' --wait",
         "stdout": stdout[-20000:],
@@ -1505,9 +1533,9 @@ def run_suite(body: SuiteRunBody):
     report_key = _find_report_key(agent_result)
     report_local, report_url = "", ""
     if report_key and body.download_report:
-        report_local, report_url = _download_run_report(report_key, suite_name or suite_id)
+        report_local, report_url = _download_run_report(report_key)
     return {
-        "ok": proc.returncode == 0,
+        "ok": proc.returncode == 0 and _suite_passed(agent_result),
         "returncode": proc.returncode,
         "cmd": " ".join(cmd[:3]) + " '<payload>' --wait",
         "stdout": stdout[-20000:],

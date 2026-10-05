@@ -109,6 +109,11 @@ def test_build_recording_entry_keeps_saved_multi_line_rows(monkeypatch) -> None:
             "recordings/demo/demo_params.xlsx",
         ),
     )
+    monkeypatch.setattr(
+        app,
+        "_saved_workbook_columns",
+        lambda key, bucket: ["invoice_number", "line_amount", "distribution_combination_id", "tree_name"],
+    )
 
     entry = app._build_recording_entry(
         "demo",
@@ -120,6 +125,73 @@ def test_build_recording_entry_keeps_saved_multi_line_rows(monkeypatch) -> None:
     assert entry["parameters"] == {"invoice_number": "INV-1"}
     assert entry["line_items"] == [{"line_amount": "100", "distribution_combination_id": "850"}]
     assert entry["skip_parameters_file_load"] is True
+    assert entry["parameter_columns"] == [
+        "invoice_number",
+        "line_amount",
+        "distribution_combination_id",
+        "tree_name",
+    ]
+
+
+def test_saved_workbook_columns_include_a_column_left_blank_in_every_row(monkeypatch) -> None:
+    import io
+
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    wb.active.title = "params"
+    wb["params"].append(["ref_id", "url"])
+    wb["params"].append(["1", "https://example.invalid"])
+    lines = wb.create_sheet("line_items")
+    lines.append(["ref_id", "value_code", "start_date"])
+    lines.append(["1", "100000", None])
+    raw = io.BytesIO()
+    wb.save(raw)
+
+    class _FakeS3:
+        def get_object(self, Bucket, Key):
+            assert (Bucket, Key) == ("tenant", "recordings/demo/demo_params.xlsx")
+            return {"Body": io.BytesIO(raw.getvalue())}
+
+    monkeypatch.setattr(app, "_s3", lambda: _FakeS3())
+
+    assert app._saved_workbook_columns("recordings/demo/demo_params.xlsx", "tenant") == [
+        "ref_id",
+        "url",
+        "value_code",
+        "start_date",
+    ]
+    assert app._saved_workbook_columns("", "tenant") == []
+
+
+def test_build_recording_entries_stamps_saved_columns_on_every_row(monkeypatch) -> None:
+    monkeypatch.setattr(app, "_load_recording_config", lambda name, bucket: {})
+    monkeypatch.setattr(
+        app,
+        "_load_saved_runtime_payload",
+        lambda name, bucket: (
+            [{"ref_id": "1", "value_set_code": "A"}, {"ref_id": "2", "value_set_code": "B"}],
+            [{"ref_id": "1", "value_code": "100000"}, {"ref_id": "2", "value_code": "1106"}],
+            "recordings/demo/demo_params.xlsx",
+        ),
+    )
+    monkeypatch.setattr(
+        app,
+        "_saved_workbook_columns",
+        lambda key, bucket: ["ref_id", "value_set_code", "value_code", "start_date"],
+    )
+
+    entries = app._build_recording_entries(
+        "demo",
+        parameters=None,
+        after_action_wait_ms=0,
+        bucket="tenant",
+    )
+
+    assert [entry["parameter_columns"] for entry in entries] == [
+        ["ref_id", "value_set_code", "value_code", "start_date"],
+        ["ref_id", "value_set_code", "value_code", "start_date"],
+    ]
 
 
 def test_normalize_repeatable_blocks_config_keeps_match_key() -> None:
@@ -184,6 +256,7 @@ def test_build_recording_entries_groups_multi_line_rows_by_match_key(monkeypatch
     assert entries[1]["line_items"] == [
         {"ref_id": "INV2", "line_description": "Line 3", "quantity": "3"},
     ]
+    assert all("parameter_columns" not in entry for entry in entries)
 
 
 def test_build_recording_entries_rejects_multi_headers_without_match_key(monkeypatch) -> None:

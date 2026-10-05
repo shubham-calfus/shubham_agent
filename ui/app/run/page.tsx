@@ -53,7 +53,7 @@ export default function RunsPage() {
                         : "border-line-2 text-ink-mid hover:text-ink"
                     }`}
                   >
-                    <StatusDotFor status={r.status} />
+                    <StatusDotFor run={r} />
                     <span className="max-w-[180px] truncate">{r.label}</span>
                     <span
                       role="button"
@@ -79,16 +79,22 @@ export default function RunsPage() {
   );
 }
 
-function StatusDotFor({ status }: { status: RunTab["status"] }) {
-  if (status === "running") return <Spinner size={12} className="text-teal" />;
-  const color =
-    status === "done" ? "bg-teal" : status === "error" ? "bg-bad" : "bg-ink-dim";
-  return <span className={`h-2 w-2 rounded-full ${color}`} />;
+// "done" only means a result came back; its `ok` says whether the run passed (restored runs stay "done").
+function runOutcome(run: RunTab): "running" | "passed" | "failed" {
+  if (run.status === "running") return "running";
+  return run.status === "done" && run.result?.ok ? "passed" : "failed";
+}
+
+function StatusDotFor({ run }: { run: RunTab }) {
+  const outcome = runOutcome(run);
+  if (outcome === "running") return <Spinner size={12} className="text-teal" />;
+  return <span className={`h-2 w-2 rounded-full ${outcome === "passed" ? "bg-teal" : "bg-bad"}`} />;
 }
 
 function RunDetail({ run }: { run: RunTab }) {
   const [showLogs, setShowLogs] = useState(false);
   const res = run.result;
+  const outcome = runOutcome(run);
 
   return (
     <FadeUp className="space-y-4">
@@ -98,14 +104,14 @@ function RunDetail({ run }: { run: RunTab }) {
             <h2 className="display text-lg font-bold text-ink">{run.label}</h2>
             <span
               className={`badge ${
-                run.status === "done"
+                outcome === "passed"
                   ? "badge-good"
-                  : run.status === "error"
+                  : outcome === "failed"
                     ? "border-bad/30 bg-bad-soft text-bad"
                     : "badge-muted"
               }`}
             >
-              {run.status === "running" ? "running" : run.status === "done" ? "passed" : "failed"}
+              {outcome}
             </span>
           </div>
           {res && (
